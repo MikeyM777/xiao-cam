@@ -23,7 +23,7 @@ public interface IXSource {
 //  Hub: newest frame, stats, recorder, board settings
 // ============================================================================
 public class XHub {
-  public string Html = "", PicturesDir = "", VideosDir = "";
+  public string Html = "", PicturesDir = "", VideosDir = "", Version = "0", FwExpected = "", SelfPath = "";
   public volatile string Status = "starting";
   public volatile string BoardJson = "";
   public volatile string LastMsg = "";
@@ -171,6 +171,7 @@ public class XHub {
     sb.Append(",\"level\":").Append(N(Level));
     sb.Append(",\"frames\":").Append(totalFrames);
     sb.Append(",\"pictures\":\"").Append(Esc(PicturesDir)).Append("\"");
+    sb.Append(",\"version\":\"").Append(Esc(Version)).Append("\",\"fwExpected\":\"").Append(Esc(FwExpected)).Append("\"");
     sb.Append(",\"videos\":\"").Append(Esc(VideosDir)).Append("\"");
     XAvi r = Rec;
     if (r != null) {
@@ -779,6 +780,14 @@ public class XWeb {
         else Send(ns, "200 OK", "image/jpeg", File.ReadAllBytes(f));
         return;
       }
+      case "/api/update/check": Json(ns, XUpdate.Check(hub)); return;
+      case "/api/update/apply":
+        try { XUpdate.Apply(hub, G(q, "flash") == "1"); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/flash":
+        if (hub.Demo) { Json(ns, Ok(false, "\"err\":\"not in demo mode\"")); return; }
+        XUpdate.Relaunch(hub, "flash"); Json(ns, Ok(true, null)); return;
       case "/api/quit": {
         Json(ns, Ok(true, null));
         var t = new Thread(delegate() { Thread.Sleep(300); hub.Shutdown(); Environment.Exit(0); });

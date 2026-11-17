@@ -1,0 +1,1 @@
+Flash fix (closes an open Studio that holds the port), Update button, Flash firmware button

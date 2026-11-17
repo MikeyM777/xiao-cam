@@ -1,7 +1,7 @@
 # Headless test of crazy mode on the demo camera. Run:  powershell -NoProfile -File tests\test-crazy.ps1
 $ErrorActionPreference = 'Stop'
 $src = Join-Path (Split-Path -Parent $PSScriptRoot) 'src'
-$cs = [IO.File]::ReadAllText("$src\studio.cs") + "`n" + [IO.File]::ReadAllText("$src\crazy.cs")
+$cs = [IO.File]::ReadAllText("$src\studio.cs") + "`n" + [IO.File]::ReadAllText("$src\crazy.cs") + "`n" + [IO.File]::ReadAllText("$src\update.cs")
 Add-Type -TypeDefinition $cs -ReferencedAssemblies System.Drawing, System.Management, System.Web.Extensions, System.Windows.Forms
 $fail = 0
 function Check($name, $ok) { if ($ok) { Write-Host "PASS $name" -ForegroundColor Green } else { Write-Host "FAIL $name" -ForegroundColor Red; $script:fail++ } }

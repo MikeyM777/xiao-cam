@@ -1,0 +1,5 @@
+{
+  "notes": "Flash fix (closes an open Studio that holds the port), Update button, Flash firmware button",
+  "studio": "2.2.0",
+  "firmware": "2.1"
+}

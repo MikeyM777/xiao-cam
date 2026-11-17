@@ -96,6 +96,7 @@ kbd{background:#222730;border:1px solid #333a45;border-bottom-width:2px;border-r
     <span class="chip" id="cTempW">board <b id="cTemp">-</b></span>
   </div>
   <div class="sp"></div>
+  <button id="updBadge" class="pri" style="display:none" title="A new version is on GitHub">Update available</button>
   <button id="snapTop" title="Save picture (S)">Snapshot</button>
   <button id="recBtnTop" title="Record (R)"><span class="rd"></span><span id="recTopTxt">REC</span></button>
   <button id="quitTop" title="Stop the studio">Quit</button>
@@ -300,6 +301,10 @@ function boardPane(p){
   <div class="sec">My profiles (saved on this PC)</div>
   <div style="display:flex;gap:6px"><input type="text" id="profName" placeholder="Profile name, e.g. Night yard"><button id="profSave">Save</button></div>
   <div id="profList" style="margin-top:6px"></div>
+  <div class="sec">Updates</div>
+  <div class="kv" id="upInfo"></div>
+  <div class="btns"><button id="upChk">Check for updates</button><button id="upGo" class="pri" style="display:none">Update now</button><button id="fwGo">Flash camera firmware</button></div>
+  <div class="hint" id="upNote"></div>
   <div class="sec">Maintenance</div>
   <div class="btns" style="margin-top:0"><button id="bSave">Save settings to board now</button><button id="bBoot">Reboot camera</button><button class="danger" id="bDef">Reset camera to defaults</button></div>
   <div class="hint">Settings are saved on the camera automatically, so they stay after unplugging.</div>
@@ -313,8 +318,22 @@ function boardPane(p){
     d.classList.remove('arm');d.textContent='Reset camera to defaults';const r=await api('/api/cmd?c=defaults');toast(r.ok?'Defaults restored, camera restarting...':'Not connected')};
   p.querySelector('#bRe').onclick=async()=>{const r=await api('/api/port?p='+$('#bPort').value);toast(r.ok?'Reconnecting...':'Bad port')};
   p.querySelector('#profSave').onclick=()=>{const n=$('#profName').value.trim();if(!n||!B){toast(B?'Type a name first':'Camera not connected');return}const o={};SENSOR_KEYS.forEach(k=>{if(B[k]!==undefined)o[k]=B[k]});const P_=profs();P_[n]=o;localStorage.xprof=JSON.stringify(P_);$('#profName').value='';drawProfs();toast('Profile saved: '+n)};
+  p.querySelector('#upChk').onclick=()=>checkUpd(false);
+  const two=(b,label,fn)=>{b.onclick=()=>{if(!b.dataset.arm){b.dataset.arm=1;const t=b.textContent;b.textContent=label;setTimeout(()=>{delete b.dataset.arm;b.textContent=t},3000);return}delete b.dataset.arm;fn()}};
+  two(p.querySelector('#upGo'),'Click again to update',async()=>{const flash=!!(UP&&UP.firmware&&B&&B.fw!==UP.firmware);const r=await api('/api/update/apply?flash='+(flash?1:0));
+    toast(r.ok?'Updating - the studio restarts in a new window'+(flash?' and flashes the camera':'')+'. This page reconnects by itself.':'Update failed: '+(r.err||''))});
+  two(p.querySelector('#fwGo'),'Click again to flash',async()=>{const r=await api('/api/flash');toast(r.ok?'Flashing - watch the new black window. This page reconnects by itself.':'Cannot flash: '+(r.err||''))});
   drawProfs();loadPorts();
 }
+let UP=null;
+async function checkUpd(silent){const r=await api('/api/update/check');UP=r;if(!silent)toast(!r.ok?(r.err||'Check failed'):r.newer?'Update available: '+r.latest:'You have the latest version');drawUpd()}
+function drawUpd(){const i=$('#upInfo');if(!i||!P)return;
+  const rows=[['Studio',P.version],['Latest on GitHub',UP?(UP.ok?UP.latest:'offline'):'checking...'],['Camera firmware',B?B.fw:'-'],['This studio wants',P.fwExpected]];
+  i.innerHTML=rows.map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join('');
+  $('#upGo').style.display=UP&&UP.newer?'':'none';
+  let n='';if(UP&&UP.newer)n+='New version '+UP.latest+(UP.notes?': '+UP.notes:'')+'. ';
+  if(B&&!P.demo&&P.fwExpected&&B.fw!==P.fwExpected)n+='The camera runs firmware '+B.fw+' - press Flash camera firmware to get '+P.fwExpected+'.';
+  $('#upNote').textContent=n;const bd=$('#updBadge');if(bd)bd.style.display=UP&&UP.newer?'':'none'}
 async function loadPorts(){const r=await api('/api/ports');const s=$('#bPort');if(!r.ok)return;const cur=P?(P.demo?'demo':P.want):'auto';
   s.innerHTML=`<option value="auto">Auto${r.auto?' ('+r.auto+')':''}</option>`+r.ports.map(x=>`<option>${x}</option>`).join('')+`<option value="demo">Demo (no camera)</option>`;s.value=cur}
 const up=s=>{s=s|0;const h=s/3600|0,m=(s%3600)/60|0;return(h?h+'h ':'')+m+'m '+(s%60)+'s'};
@@ -372,8 +391,8 @@ setInterval(analyse,350);
 let lastLive=false;
 function fmtRate(k){return k>=1000?(k/8000).toFixed(2)+' MB/s':(k/8).toFixed(0)+' KB/s'}
 const mmss=s=>{s=s|0;return String(s/60|0).padStart(2,'0')+':'+String(s%60).padStart(2,'0')};
-function refresh(){upd.forEach(d=>d.upd());updWifi();updBoard()}
-async function poll(){const s=await api('/api/state');if(s&&s.pc){P=s.pc;B=s.board}else{P=null}
+function refresh(){upd.forEach(d=>d.upd());updWifi();updBoard();drawUpd()}
+async function poll(){const s=await api('/api/state');if(s&&s.pc){if(poll.down){location.reload();return}P=s.pc;B=s.board}else{P=null;poll.down=true}
   const dot=$('#dot'),st=$('#stat');
   if(!P){dot.className='dot er';st.textContent='studio stopped - run the bat again'}
   else{dot.className='dot '+(P.live?'ok':P.connected?'wa':'er');st.textContent=P.demo?'Demo camera (no board)':(P.port?P.port+' - ':'')+P.status}
@@ -401,6 +420,8 @@ TABS.forEach(([id,label,items],i)=>{
 if(localStorage.xtab){const b=document.querySelector(`#tabs button[data-id="${localStorage.xtab}"]`);if(b)b.click()}
 
 initCompare();
+setTimeout(()=>checkUpd(true),3000);
+$('#updBadge').onclick=()=>document.querySelector('#tabs button[data-id=board]').click();
 setInterval(poll,500);poll();
 $('#snapTop').onclick=snap;$('#recBtnTop').onclick=toggleRec;
 $('#quitTop').onclick=async()=>{if(!$('#quitTop').dataset.arm){$('#quitTop').dataset.arm=1;$('#quitTop').textContent='Click to confirm';setTimeout(()=>{delete $('#quitTop').dataset.arm;$('#quitTop').textContent='Quit'},3000);return}

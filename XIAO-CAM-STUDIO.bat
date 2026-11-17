@@ -24,6 +24,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+$StudioVersion   = '2.2.0'      # bump on every release (Update button compares this)
+$FirmwareVersion = '2.1'        # bump when the sketch below changes (Studio then asks to flash)
 $Ssid = 'XIAO-CAM'            # first-time hotspot name (change later in the Studio, WiFi tab)
 $Pass = 'xiaocam123'          # first-time hotspot password: at least 8 characters
 $StudioPort = 8787
@@ -62,7 +64,7 @@ $Sketch = @'
 #include <ESP_I2S.h>
 #include "esp_http_server.h"
 
-#define FW_VERSION "2.0"
+#define FW_VERSION "@@FWVER@@"
 #define LED_PIN 21
 #define MIC_RATE 16000
 
@@ -538,7 +540,7 @@ public interface IXSource {
 //  Hub: newest frame, stats, recorder, board settings
 // ============================================================================
 public class XHub {
-  public string Html = "", PicturesDir = "", VideosDir = "";
+  public string Html = "", PicturesDir = "", VideosDir = "", Version = "0", FwExpected = "", SelfPath = "";
   public volatile string Status = "starting";
   public volatile string BoardJson = "";
   public volatile string LastMsg = "";
@@ -686,6 +688,7 @@ public class XHub {
     sb.Append(",\"level\":").Append(N(Level));
     sb.Append(",\"frames\":").Append(totalFrames);
     sb.Append(",\"pictures\":\"").Append(Esc(PicturesDir)).Append("\"");
+    sb.Append(",\"version\":\"").Append(Esc(Version)).Append("\",\"fwExpected\":\"").Append(Esc(FwExpected)).Append("\"");
     sb.Append(",\"videos\":\"").Append(Esc(VideosDir)).Append("\"");
     XAvi r = Rec;
     if (r != null) {
@@ -1294,6 +1297,14 @@ public class XWeb {
         else Send(ns, "200 OK", "image/jpeg", File.ReadAllBytes(f));
         return;
       }
+      case "/api/update/check": Json(ns, XUpdate.Check(hub)); return;
+      case "/api/update/apply":
+        try { XUpdate.Apply(hub, G(q, "flash") == "1"); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/flash":
+        if (hub.Demo) { Json(ns, Ok(false, "\"err\":\"not in demo mode\"")); return; }
+        XUpdate.Relaunch(hub, "flash"); Json(ns, Ok(true, null)); return;
       case "/api/quit": {
         Json(ns, Ok(true, null));
         var t = new Thread(delegate() { Thread.Sleep(300); hub.Shutdown(); Environment.Exit(0); });
@@ -1815,6 +1826,75 @@ public class XCrazy {
     return Js().Serialize(o).TrimEnd('}') + ",\"scores\":" + LastScoresJson + "}";
   }
 }
+
+// ============================================================================
+//  Updates from GitHub (public repo) + restart / re-flash from the Studio
+// ============================================================================
+public static class XUpdate {
+  public const string Repo = "MikeyM777/xiao-cam";
+  static string Raw(string f) { return "https://raw.githubusercontent.com/" + Repo + "/main/" + f + "?nocache=" + DateTime.UtcNow.Ticks; }
+  static WebClient Client() {
+    ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+    var w = new WebClient(); w.Headers["User-Agent"] = "xiao-cam-studio"; w.Encoding = Encoding.UTF8; return w;
+  }
+
+  public static string Check(XHub hub) {
+    var o = new Dictionary<string, object>();
+    try {
+      string j; using (var w = Client()) j = w.DownloadString(Raw("version.json"));
+      var d = XCrazy.Js().DeserializeObject(j) as Dictionary<string, object>;
+      string latest = Convert.ToString(d["studio"]);
+      o["ok"] = true; o["current"] = hub.Version; o["latest"] = latest;
+      o["firmware"] = d.ContainsKey("firmware") ? Convert.ToString(d["firmware"]) : "";
+      o["notes"] = d.ContainsKey("notes") ? Convert.ToString(d["notes"]) : "";
+      o["newer"] = Newer(latest, hub.Version);
+    } catch (Exception e) { o["ok"] = false; o["err"] = "could not reach GitHub: " + e.Message; o["current"] = hub.Version; }
+    return XCrazy.Js().Serialize(o);
+  }
+  static bool Newer(string a, string b) {
+    try { return new Version(a) > new Version(b); } catch { return a != b; }
+  }
+
+  // download the new bat, keep the old one as .prev.bat, restart (and flash if the firmware changed)
+  public static void Apply(XHub hub, bool flash) {
+    if (string.IsNullOrEmpty(hub.SelfPath) || !File.Exists(hub.SelfPath)) throw new Exception("cannot find the running bat file");
+    byte[] b; using (var w = Client()) b = w.DownloadData(Raw("XIAO-CAM-STUDIO.bat"));
+    string head = Encoding.ASCII.GetString(b, 0, Math.Min(b.Length, 200));
+    if (b.Length < 50000 || !head.StartsWith("<# : XIAO-CAM Studio")) throw new Exception("the downloaded file does not look right - not updated");
+    string dir = Path.GetDirectoryName(hub.SelfPath);
+    string tmp = hub.SelfPath + ".new", prev = Path.Combine(dir, "XIAO-CAM-STUDIO.prev.bat");
+    File.WriteAllBytes(tmp, b);
+    File.Copy(hub.SelfPath, prev, true);
+    File.Copy(tmp, hub.SelfPath, true);
+    File.Delete(tmp);
+    Relaunch(hub, flash ? "flash" : "view");
+  }
+
+  // start the bat again in a new window, then close this one (the camera port must be free for flashing)
+  public static void Relaunch(XHub hub, string mode) {
+    var psi = new ProcessStartInfo("cmd.exe", "/c start \"XIAO CAM Studio\" cmd /c \"\"" + hub.SelfPath + "\"\"");
+    psi.UseShellExecute = false; psi.CreateNoWindow = true;
+    psi.EnvironmentVariables["XCAM_MODE"] = mode;
+    psi.EnvironmentVariables["XCAM_NOBROWSER"] = "1";      // the open browser tab reconnects by itself
+    psi.WorkingDirectory = Path.GetDirectoryName(hub.SelfPath);
+    var t = new Thread(delegate() {
+      Thread.Sleep(400);
+      hub.Shutdown();
+      Process.Start(psi);
+      // the old cmd window would keep reading the (now replaced) bat file: close it too
+      try {
+        int me = Process.GetCurrentProcess().Id;
+        using (var q = new ManagementObjectSearcher("SELECT ParentProcessId FROM Win32_Process WHERE ProcessId=" + me))
+          foreach (ManagementObject o in q.Get()) {
+            var parent = Process.GetProcessById(Convert.ToInt32(o["ParentProcessId"]));
+            if (parent.ProcessName.Equals("cmd", StringComparison.OrdinalIgnoreCase)) parent.Kill();
+          }
+      } catch { }
+      Environment.Exit(0);
+    });
+    t.IsBackground = true; t.Start();
+  }
+}
 '@
 
 # ----------------------------------------------------------------------------
@@ -1919,6 +1999,7 @@ kbd{background:#222730;border:1px solid #333a45;border-bottom-width:2px;border-r
     <span class="chip" id="cTempW">board <b id="cTemp">-</b></span>
   </div>
   <div class="sp"></div>
+  <button id="updBadge" class="pri" style="display:none" title="A new version is on GitHub">Update available</button>
   <button id="snapTop" title="Save picture (S)">Snapshot</button>
   <button id="recBtnTop" title="Record (R)"><span class="rd"></span><span id="recTopTxt">REC</span></button>
   <button id="quitTop" title="Stop the studio">Quit</button>
@@ -2345,6 +2426,10 @@ function boardPane(p){
   <div class="sec">My profiles (saved on this PC)</div>
   <div style="display:flex;gap:6px"><input type="text" id="profName" placeholder="Profile name, e.g. Night yard"><button id="profSave">Save</button></div>
   <div id="profList" style="margin-top:6px"></div>
+  <div class="sec">Updates</div>
+  <div class="kv" id="upInfo"></div>
+  <div class="btns"><button id="upChk">Check for updates</button><button id="upGo" class="pri" style="display:none">Update now</button><button id="fwGo">Flash camera firmware</button></div>
+  <div class="hint" id="upNote"></div>
   <div class="sec">Maintenance</div>
   <div class="btns" style="margin-top:0"><button id="bSave">Save settings to board now</button><button id="bBoot">Reboot camera</button><button class="danger" id="bDef">Reset camera to defaults</button></div>
   <div class="hint">Settings are saved on the camera automatically, so they stay after unplugging.</div>
@@ -2358,8 +2443,22 @@ function boardPane(p){
     d.classList.remove('arm');d.textContent='Reset camera to defaults';const r=await api('/api/cmd?c=defaults');toast(r.ok?'Defaults restored, camera restarting...':'Not connected')};
   p.querySelector('#bRe').onclick=async()=>{const r=await api('/api/port?p='+$('#bPort').value);toast(r.ok?'Reconnecting...':'Bad port')};
   p.querySelector('#profSave').onclick=()=>{const n=$('#profName').value.trim();if(!n||!B){toast(B?'Type a name first':'Camera not connected');return}const o={};SENSOR_KEYS.forEach(k=>{if(B[k]!==undefined)o[k]=B[k]});const P_=profs();P_[n]=o;localStorage.xprof=JSON.stringify(P_);$('#profName').value='';drawProfs();toast('Profile saved: '+n)};
+  p.querySelector('#upChk').onclick=()=>checkUpd(false);
+  const two=(b,label,fn)=>{b.onclick=()=>{if(!b.dataset.arm){b.dataset.arm=1;const t=b.textContent;b.textContent=label;setTimeout(()=>{delete b.dataset.arm;b.textContent=t},3000);return}delete b.dataset.arm;fn()}};
+  two(p.querySelector('#upGo'),'Click again to update',async()=>{const flash=!!(UP&&UP.firmware&&B&&B.fw!==UP.firmware);const r=await api('/api/update/apply?flash='+(flash?1:0));
+    toast(r.ok?'Updating - the studio restarts in a new window'+(flash?' and flashes the camera':'')+'. This page reconnects by itself.':'Update failed: '+(r.err||''))});
+  two(p.querySelector('#fwGo'),'Click again to flash',async()=>{const r=await api('/api/flash');toast(r.ok?'Flashing - watch the new black window. This page reconnects by itself.':'Cannot flash: '+(r.err||''))});
   drawProfs();loadPorts();
 }
+let UP=null;
+async function checkUpd(silent){const r=await api('/api/update/check');UP=r;if(!silent)toast(!r.ok?(r.err||'Check failed'):r.newer?'Update available: '+r.latest:'You have the latest version');drawUpd()}
+function drawUpd(){const i=$('#upInfo');if(!i||!P)return;
+  const rows=[['Studio',P.version],['Latest on GitHub',UP?(UP.ok?UP.latest:'offline'):'checking...'],['Camera firmware',B?B.fw:'-'],['This studio wants',P.fwExpected]];
+  i.innerHTML=rows.map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join('');
+  $('#upGo').style.display=UP&&UP.newer?'':'none';
+  let n='';if(UP&&UP.newer)n+='New version '+UP.latest+(UP.notes?': '+UP.notes:'')+'. ';
+  if(B&&!P.demo&&P.fwExpected&&B.fw!==P.fwExpected)n+='The camera runs firmware '+B.fw+' - press Flash camera firmware to get '+P.fwExpected+'.';
+  $('#upNote').textContent=n;const bd=$('#updBadge');if(bd)bd.style.display=UP&&UP.newer?'':'none'}
 async function loadPorts(){const r=await api('/api/ports');const s=$('#bPort');if(!r.ok)return;const cur=P?(P.demo?'demo':P.want):'auto';
   s.innerHTML=`<option value="auto">Auto${r.auto?' ('+r.auto+')':''}</option>`+r.ports.map(x=>`<option>${x}</option>`).join('')+`<option value="demo">Demo (no camera)</option>`;s.value=cur}
 const up=s=>{s=s|0;const h=s/3600|0,m=(s%3600)/60|0;return(h?h+'h ':'')+m+'m '+(s%60)+'s'};
@@ -2417,8 +2516,8 @@ setInterval(analyse,350);
 let lastLive=false;
 function fmtRate(k){return k>=1000?(k/8000).toFixed(2)+' MB/s':(k/8).toFixed(0)+' KB/s'}
 const mmss=s=>{s=s|0;return String(s/60|0).padStart(2,'0')+':'+String(s%60).padStart(2,'0')};
-function refresh(){upd.forEach(d=>d.upd());updWifi();updBoard()}
-async function poll(){const s=await api('/api/state');if(s&&s.pc){P=s.pc;B=s.board}else{P=null}
+function refresh(){upd.forEach(d=>d.upd());updWifi();updBoard();drawUpd()}
+async function poll(){const s=await api('/api/state');if(s&&s.pc){if(poll.down){location.reload();return}P=s.pc;B=s.board}else{P=null;poll.down=true}
   const dot=$('#dot'),st=$('#stat');
   if(!P){dot.className='dot er';st.textContent='studio stopped - run the bat again'}
   else{dot.className='dot '+(P.live?'ok':P.connected?'wa':'er');st.textContent=P.demo?'Demo camera (no board)':(P.port?P.port+' - ':'')+P.status}
@@ -2446,6 +2545,8 @@ TABS.forEach(([id,label,items],i)=>{
 if(localStorage.xtab){const b=document.querySelector(`#tabs button[data-id="${localStorage.xtab}"]`);if(b)b.click()}
 
 initCompare();
+setTimeout(()=>checkUpd(true),3000);
+$('#updBadge').onclick=()=>document.querySelector('#tabs button[data-id=board]').click();
 setInterval(poll,500);poll();
 $('#snapTop').onclick=snap;$('#recBtnTop').onclick=toggleRec;
 $('#quitTop').onclick=async()=>{if(!$('#quitTop').dataset.arm){$('#quitTop').dataset.arm=1;$('#quitTop').textContent='Click to confirm';setTimeout(()=>{delete $('#quitTop').dataset.arm;$('#quitTop').textContent='Quit'},3000);return}
@@ -2503,33 +2604,57 @@ function Install-Tools {
 function Build-Firmware {
   Say "Building the camera firmware"
   New-Item -ItemType Directory -Force $SketchDir, $BuildDir | Out-Null
-  $code = $Sketch.Replace('@@SSID@@', $Ssid).Replace('@@PASS@@', $Pass)
+  $code = $Sketch.Replace('@@SSID@@', $Ssid).Replace('@@PASS@@', $Pass).Replace('@@FWVER@@', $FirmwareVersion)
   [IO.File]::WriteAllText((Join-Path $SketchDir 'xiaocam2.ino'), $code)
   Run-Arduino compile --fqbn $Fqbn --output-dir $BuildDir $SketchDir
   Ok "build OK"
 }
 
-function Flash-Firmware {
-  $port = Wait-CamPort
-  Say "Flashing to $port (do not unplug)"
-  & $Cli upload -p $port --fqbn $Fqbn --input-dir $BuildDir $SketchDir
-  if ($LASTEXITCODE -ne 0) {
-    Warn "Flash failed. Unplug the XIAO, HOLD the BOOT button (B), plug it back in, let go."
-    Read-Host "Then press Enter to try again"
-    $port = Wait-CamPort
-    & $Cli upload -p $port --fqbn $Fqbn --input-dir $BuildDir $SketchDir
-    if ($LASTEXITCODE -ne 0) { throw "flash failed twice" }
-    Warn "If you used the BOOT button: press the RESET button (R) or unplug/replug once now."
+# a Studio that is still open keeps the camera port busy ("Access is denied"): ask it to quit
+function Stop-OtherStudio {
+  $found = $false
+  foreach ($p in 8787..8816) {
+    try {
+      $r = Invoke-WebRequest "http://127.0.0.1:$p/api/state" -UseBasicParsing -TimeoutSec 2
+      if ($r.Content -match '"pc"') {
+        Warn "Closing the Studio that is still open on port $p (it holds the camera port)"
+        try { Invoke-WebRequest "http://127.0.0.1:$p/api/quit" -UseBasicParsing -TimeoutSec 3 | Out-Null } catch { }
+        $found = $true
+      }
+    } catch { }
   }
+  if ($found) { Start-Sleep -Seconds 3 }
+}
+
+function Flash-Firmware {
+  Stop-OtherStudio
+  $bootUsed = $false
+  for ($try = 1; $try -le 3; $try++) {
+    $port = Wait-CamPort
+    Say "Flashing to $port (do not unplug)  - try $try of 3"
+    & $Cli upload -p $port --fqbn $Fqbn --input-dir $BuildDir $SketchDir
+    if ($LASTEXITCODE -eq 0) { break }
+    if ($try -eq 1) {
+      Warn "Flash failed - the port may be busy. Freeing it and trying again..."
+      Stop-OtherStudio; Start-Sleep -Seconds 2
+    } elseif ($try -eq 2) {
+      Warn "Still failing. Close Arduino IDE / serial monitors / other camera windows if any are open."
+      Warn "Then: unplug the XIAO, HOLD the BOOT button (B), plug it back in, let go."
+      Read-Host "Press Enter to try again"
+      $bootUsed = $true
+    } else { throw "flash failed 3 times - another program is probably using $port" }
+  }
+  if ($bootUsed) { Warn "You used the BOOT button: press the RESET button (R) or unplug/replug once now." }
   Ok "flashed. Camera restarts..."
   Start-Sleep -Seconds 4
 }
 
 function Start-Studio([bool]$demo) {
   Say "Starting XIAO CAM Studio"
-  if (-not ('XHub' -as [type])) { Add-Type -TypeDefinition $StudioCs -ReferencedAssemblies System.Drawing, System.Management, System.Web.Extensions, System.Windows.Forms }
+  if (-not ('XHub' -as [type])) { Add-Type -TypeDefinition $StudioCs -ReferencedAssemblies System.Drawing, System.Management, System.Web.Extensions, System.Windows.Forms, System.Net }
   $hub = New-Object XHub
   $hub.Html = $Html
+  $hub.Version = $StudioVersion; $hub.FwExpected = $FirmwareVersion; $hub.SelfPath = $env:XCAM_SELF
   $hub.PicturesDir = Join-Path $Root 'pictures'
   $hub.VideosDir = Join-Path $Root 'videos'
   $hub.Demo = $demo

@@ -10,7 +10,7 @@
 #include <ESP_I2S.h>
 #include "esp_http_server.h"
 
-#define FW_VERSION "2.0"
+#define FW_VERSION "@@FWVER@@"
 #define LED_PIN 21
 #define MIC_RATE 16000
 

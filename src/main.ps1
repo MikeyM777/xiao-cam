@@ -24,6 +24,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
+$StudioVersion   = '2.2.0'      # bump on every release (Update button compares this)
+$FirmwareVersion = '2.1'        # bump when the sketch below changes (Studio then asks to flash)
 $Ssid = 'XIAO-CAM'            # first-time hotspot name (change later in the Studio, WiFi tab)
 $Pass = 'xiaocam123'          # first-time hotspot password: at least 8 characters
 $StudioPort = 8787
@@ -117,33 +119,57 @@ function Install-Tools {
 function Build-Firmware {
   Say "Building the camera firmware"
   New-Item -ItemType Directory -Force $SketchDir, $BuildDir | Out-Null
-  $code = $Sketch.Replace('@@SSID@@', $Ssid).Replace('@@PASS@@', $Pass)
+  $code = $Sketch.Replace('@@SSID@@', $Ssid).Replace('@@PASS@@', $Pass).Replace('@@FWVER@@', $FirmwareVersion)
   [IO.File]::WriteAllText((Join-Path $SketchDir 'xiaocam2.ino'), $code)
   Run-Arduino compile --fqbn $Fqbn --output-dir $BuildDir $SketchDir
   Ok "build OK"
 }
 
-function Flash-Firmware {
-  $port = Wait-CamPort
-  Say "Flashing to $port (do not unplug)"
-  & $Cli upload -p $port --fqbn $Fqbn --input-dir $BuildDir $SketchDir
-  if ($LASTEXITCODE -ne 0) {
-    Warn "Flash failed. Unplug the XIAO, HOLD the BOOT button (B), plug it back in, let go."
-    Read-Host "Then press Enter to try again"
-    $port = Wait-CamPort
-    & $Cli upload -p $port --fqbn $Fqbn --input-dir $BuildDir $SketchDir
-    if ($LASTEXITCODE -ne 0) { throw "flash failed twice" }
-    Warn "If you used the BOOT button: press the RESET button (R) or unplug/replug once now."
+# a Studio that is still open keeps the camera port busy ("Access is denied"): ask it to quit
+function Stop-OtherStudio {
+  $found = $false
+  foreach ($p in 8787..8816) {
+    try {
+      $r = Invoke-WebRequest "http://127.0.0.1:$p/api/state" -UseBasicParsing -TimeoutSec 2
+      if ($r.Content -match '"pc"') {
+        Warn "Closing the Studio that is still open on port $p (it holds the camera port)"
+        try { Invoke-WebRequest "http://127.0.0.1:$p/api/quit" -UseBasicParsing -TimeoutSec 3 | Out-Null } catch { }
+        $found = $true
+      }
+    } catch { }
   }
+  if ($found) { Start-Sleep -Seconds 3 }
+}
+
+function Flash-Firmware {
+  Stop-OtherStudio
+  $bootUsed = $false
+  for ($try = 1; $try -le 3; $try++) {
+    $port = Wait-CamPort
+    Say "Flashing to $port (do not unplug)  - try $try of 3"
+    & $Cli upload -p $port --fqbn $Fqbn --input-dir $BuildDir $SketchDir
+    if ($LASTEXITCODE -eq 0) { break }
+    if ($try -eq 1) {
+      Warn "Flash failed - the port may be busy. Freeing it and trying again..."
+      Stop-OtherStudio; Start-Sleep -Seconds 2
+    } elseif ($try -eq 2) {
+      Warn "Still failing. Close Arduino IDE / serial monitors / other camera windows if any are open."
+      Warn "Then: unplug the XIAO, HOLD the BOOT button (B), plug it back in, let go."
+      Read-Host "Press Enter to try again"
+      $bootUsed = $true
+    } else { throw "flash failed 3 times - another program is probably using $port" }
+  }
+  if ($bootUsed) { Warn "You used the BOOT button: press the RESET button (R) or unplug/replug once now." }
   Ok "flashed. Camera restarts..."
   Start-Sleep -Seconds 4
 }
 
 function Start-Studio([bool]$demo) {
   Say "Starting XIAO CAM Studio"
-  if (-not ('XHub' -as [type])) { Add-Type -TypeDefinition $StudioCs -ReferencedAssemblies System.Drawing, System.Management, System.Web.Extensions, System.Windows.Forms }
+  if (-not ('XHub' -as [type])) { Add-Type -TypeDefinition $StudioCs -ReferencedAssemblies System.Drawing, System.Management, System.Web.Extensions, System.Windows.Forms, System.Net }
   $hub = New-Object XHub
   $hub.Html = $Html
+  $hub.Version = $StudioVersion; $hub.FwExpected = $FirmwareVersion; $hub.SelfPath = $env:XCAM_SELF
   $hub.PicturesDir = Join-Path $Root 'pictures'
   $hub.VideosDir = Join-Path $Root 'videos'
   $hub.Demo = $demo
