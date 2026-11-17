@@ -2,6 +2,8 @@
 @echo off
 setlocal
 set "XCAM_SELF=%~f0"
+if not "%~1"=="" set "XCAM_MODE=%~1"
+if /i "%~2"=="nobrowser" set "XCAM_NOBROWSER=1"
 if not defined XCAM_MODE set "XCAM_MODE=menu"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ([IO.File]::ReadAllText($env:XCAM_SELF))"
 echo.

@@ -2,6 +2,8 @@
 @echo off
 setlocal
 set "XCAM_SELF=%~f0"
+if not "%~1"=="" set "XCAM_MODE=%~1"
+if /i "%~2"=="nobrowser" set "XCAM_NOBROWSER=1"
 if not defined XCAM_MODE set "XCAM_MODE=menu"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ([IO.File]::ReadAllText($env:XCAM_SELF))"
 echo.
@@ -547,6 +549,7 @@ public class XHub {
   public volatile bool Demo;
   public string WantPort = "auto";
   public IXSource Source;
+  public XWeb Web;
   public XAvi Rec;
   public volatile float Level;
   public DateTime LastCfgAt = DateTime.MinValue, LastFrameAt = DateTime.MinValue;
@@ -1134,7 +1137,8 @@ public class XAvi {
 // ============================================================================
 public class XWeb {
   readonly XHub hub; TcpListener lst; public int Port;
-  public XWeb(XHub h) { hub = h; }
+  public XWeb(XHub h) { hub = h; h.Web = this; }
+  public void Stop() { try { lst.Stop(); } catch { } }
   public int Start(int port) {
     for (int i = 0; i < 30; i++) {
       try {
@@ -1307,7 +1311,7 @@ public class XWeb {
         XUpdate.Relaunch(hub, "flash"); Json(ns, Ok(true, null)); return;
       case "/api/quit": {
         Json(ns, Ok(true, null));
-        var t = new Thread(delegate() { Thread.Sleep(300); hub.Shutdown(); Environment.Exit(0); });
+        var t = new Thread(delegate() { Thread.Sleep(300); hub.Shutdown(); XUpdate.ExitNow(); });
         t.IsBackground = true; t.Start();
         return;
       }
@@ -1833,6 +1837,12 @@ public class XCrazy {
 public static class XUpdate {
   public const string Repo = "MikeyM777/xiao-cam";
   static string Raw(string f) { return "https://raw.githubusercontent.com/" + Repo + "/main/" + f + "?nocache=" + DateTime.UtcNow.Ticks; }
+  // GitHub API first (always fresh), raw CDN as fallback
+  static byte[] Fetch(string file) {
+    try {
+      using (var w = Client()) { w.Headers["Accept"] = "application/vnd.github.raw"; return w.DownloadData("https://api.github.com/repos/" + Repo + "/contents/" + file + "?ref=main"); }
+    } catch { using (var w = Client()) return w.DownloadData(Raw(file)); }
+  }
   static WebClient Client() {
     ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
     var w = new WebClient(); w.Headers["User-Agent"] = "xiao-cam-studio"; w.Encoding = Encoding.UTF8; return w;
@@ -1841,7 +1851,7 @@ public static class XUpdate {
   public static string Check(XHub hub) {
     var o = new Dictionary<string, object>();
     try {
-      string j; using (var w = Client()) j = w.DownloadString(Raw("version.json"));
+      string j = Encoding.UTF8.GetString(Fetch("version.json")).TrimStart((char)0xFEFF);
       var d = XCrazy.Js().DeserializeObject(j) as Dictionary<string, object>;
       string latest = Convert.ToString(d["studio"]);
       o["ok"] = true; o["current"] = hub.Version; o["latest"] = latest;
@@ -1858,9 +1868,11 @@ public static class XUpdate {
   // download the new bat, keep the old one as .prev.bat, restart (and flash if the firmware changed)
   public static void Apply(XHub hub, bool flash) {
     if (string.IsNullOrEmpty(hub.SelfPath) || !File.Exists(hub.SelfPath)) throw new Exception("cannot find the running bat file");
-    byte[] b; using (var w = Client()) b = w.DownloadData(Raw("XIAO-CAM-STUDIO.bat"));
+    byte[] b = Fetch("XIAO-CAM-STUDIO.bat");
     string head = Encoding.ASCII.GetString(b, 0, Math.Min(b.Length, 200));
     if (b.Length < 50000 || !head.StartsWith("<# : XIAO-CAM Studio")) throw new Exception("the downloaded file does not look right - not updated");
+    var mv = Regex.Match(Encoding.ASCII.GetString(b), "\\$StudioVersion\\s*=\\s*'([^']+)'");
+    if (!mv.Success || !Newer(mv.Groups[1].Value, hub.Version)) throw new Exception("GitHub is still updating - try again in a few minutes");
     string dir = Path.GetDirectoryName(hub.SelfPath);
     string tmp = hub.SelfPath + ".new", prev = Path.Combine(dir, "XIAO-CAM-STUDIO.prev.bat");
     File.WriteAllBytes(tmp, b);
@@ -1870,27 +1882,33 @@ public static class XUpdate {
     Relaunch(hub, flash ? "flash" : "view");
   }
 
+  // close this Studio for good: its cmd window too (it would keep reading the replaced bat file).
+  // Environment.Exit from a worker thread can hang inside PowerShell, so kill instead (shutdown already ran).
+  public static void ExitNow() {
+    var me = Process.GetCurrentProcess();
+    try {
+      using (var q = new ManagementObjectSearcher("SELECT ParentProcessId FROM Win32_Process WHERE ProcessId=" + me.Id))
+        foreach (ManagementObject o in q.Get()) {
+          var parent = Process.GetProcessById(Convert.ToInt32(o["ParentProcessId"]));
+          if (parent.ProcessName.Equals("cmd", StringComparison.OrdinalIgnoreCase)) parent.Kill();
+        }
+    } catch { }
+    me.Kill();
+  }
+
   // start the bat again in a new window, then close this one (the camera port must be free for flashing)
   public static void Relaunch(XHub hub, string mode) {
-    var psi = new ProcessStartInfo("cmd.exe", "/c start \"XIAO CAM Studio\" cmd /c \"\"" + hub.SelfPath + "\"\"");
-    psi.UseShellExecute = false; psi.CreateNoWindow = true;
-    psi.EnvironmentVariables["XCAM_MODE"] = mode;
-    psi.EnvironmentVariables["XCAM_NOBROWSER"] = "1";      // the open browser tab reconnects by itself
+    // ShellExecute = new window and NO inherited handles (an inherited socket would keep the port busy)
+    var psi = new ProcessStartInfo(hub.SelfPath, mode + " nobrowser");   // the open browser tab reconnects by itself
+    psi.UseShellExecute = true;
     psi.WorkingDirectory = Path.GetDirectoryName(hub.SelfPath);
     var t = new Thread(delegate() {
       Thread.Sleep(400);
       hub.Shutdown();
+      XWeb web = hub.Web; if (web != null) web.Stop();
+      Thread.Sleep(300);
       Process.Start(psi);
-      // the old cmd window would keep reading the (now replaced) bat file: close it too
-      try {
-        int me = Process.GetCurrentProcess().Id;
-        using (var q = new ManagementObjectSearcher("SELECT ParentProcessId FROM Win32_Process WHERE ProcessId=" + me))
-          foreach (ManagementObject o in q.Get()) {
-            var parent = Process.GetProcessById(Convert.ToInt32(o["ParentProcessId"]));
-            if (parent.ProcessName.Equals("cmd", StringComparison.OrdinalIgnoreCase)) parent.Kill();
-          }
-      } catch { }
-      Environment.Exit(0);
+      ExitNow();
     });
     t.IsBackground = true; t.Start();
   }

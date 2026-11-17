@@ -59,6 +59,14 @@ try {
   }
 
   if (-not (Test-Path "$Home2\XIAO-CAM-STUDIO.bat")) {
+    Warn "XIAO-CAM-STUDIO.bat is not in Downloads - getting the newest from GitHub (MikeyM777/xiao-cam)"
+    try {
+      [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      Invoke-WebRequest "https://raw.githubusercontent.com/MikeyM777/xiao-cam/main/XIAO-CAM-STUDIO.bat" -OutFile "$Home2\XIAO-CAM-STUDIO.bat" -UseBasicParsing
+      Ok "downloaded"
+    } catch { Warn "download failed: $($_.Exception.Message)" }
+  }
+  if (-not (Test-Path "$Home2\XIAO-CAM-STUDIO.bat")) {
     throw "XIAO-CAM-STUDIO.bat not found in $($places -join ' or '). Download it from Telegram first, then run this again."
   }
 

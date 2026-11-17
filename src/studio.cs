@@ -30,6 +30,7 @@ public class XHub {
   public volatile bool Demo;
   public string WantPort = "auto";
   public IXSource Source;
+  public XWeb Web;
   public XAvi Rec;
   public volatile float Level;
   public DateTime LastCfgAt = DateTime.MinValue, LastFrameAt = DateTime.MinValue;
@@ -617,7 +618,8 @@ public class XAvi {
 // ============================================================================
 public class XWeb {
   readonly XHub hub; TcpListener lst; public int Port;
-  public XWeb(XHub h) { hub = h; }
+  public XWeb(XHub h) { hub = h; h.Web = this; }
+  public void Stop() { try { lst.Stop(); } catch { } }
   public int Start(int port) {
     for (int i = 0; i < 30; i++) {
       try {
@@ -790,7 +792,7 @@ public class XWeb {
         XUpdate.Relaunch(hub, "flash"); Json(ns, Ok(true, null)); return;
       case "/api/quit": {
         Json(ns, Ok(true, null));
-        var t = new Thread(delegate() { Thread.Sleep(300); hub.Shutdown(); Environment.Exit(0); });
+        var t = new Thread(delegate() { Thread.Sleep(300); hub.Shutdown(); XUpdate.ExitNow(); });
         t.IsBackground = true; t.Start();
         return;
       }
