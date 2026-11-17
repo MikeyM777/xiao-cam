@@ -50,8 +50,8 @@ main{display:grid;grid-template-columns:1fr 372px;min-height:0}
 .big{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
 #hist{width:100%;height:44px;display:block}
 aside{background:var(--p);border-left:1px solid var(--ln);display:grid;grid-template-rows:auto 1fr;min-height:0}
-#tabs{display:grid;grid-template-columns:repeat(6,1fr);border-bottom:1px solid var(--ln)}
-#tabs button{border:0;border-radius:0;background:transparent;padding:11px 2px;color:var(--mu);border-bottom:2px solid transparent;font-size:12.5px}
+#tabs{display:grid;grid-template-columns:repeat(7,1fr);border-bottom:1px solid var(--ln)}
+#tabs button{border:0;border-radius:0;background:transparent;padding:11px 2px;color:var(--mu);border-bottom:2px solid transparent;font-size:12px}
 #tabs button.on{color:var(--tx);border-bottom-color:var(--ac)}
 #panes{overflow:auto;padding:4px 14px 24px;scrollbar-width:thin;scrollbar-color:#2a2f37 transparent}
 .pane{display:none}.pane.on{display:block}
@@ -135,6 +135,7 @@ kbd{background:#222730;border:1px solid #333a45;border-bottom-width:2px;border-r
 </main>
 </div>
 <div id="toast"></div>
+<!--CRAZY-->
 <script>
 'use strict';
 const $=s=>document.querySelector(s);
@@ -208,7 +209,7 @@ const COLOR=[
  {sec:'Test'},
  {k:'colorbar',t:'tog',l:'Color bars test pattern'},
 ];
-const TABS=[['image','Image',IMAGE],['light','Exposure',LIGHT],['color','Color',COLOR],['rec','Record',recPane],['wifi','WiFi',wifiPane],['board','Board',boardPane]];
+const TABS=[['image','Image',IMAGE],['light','Light',LIGHT],['color','Color',COLOR],['crazy','Crazy',crazyPane],['rec','Record',recPane],['wifi','WiFi',wifiPane],['board','Board',boardPane]];
 // ---------- presets + profiles ----------
 const SENSOR_KEYS=['framesize','quality','fps_limit','brightness','contrast','saturation','sharpness','denoise','effect','awb','awb_gain','wb_mode','aec','aec2','ae_level','aec_value','agc','agc_gain','gainceiling','bpc','wpc','raw_gma','lenc','hmirror','vflip','dcw','xclk'];
 async function applySet(o){for(const k of SENSOR_KEYS)if(k in o){pend[k]={v:+o[k],t:Date.now()};await api('/api/set?k='+k+'&v='+o[k])}refresh()}
@@ -346,7 +347,7 @@ function tool(t){const b=document.querySelector(`#tools [data-t="${t}"]`);
   localStorage.xview=JSON.stringify({rot:V.rot,mir:V.mir,grid:V.grid,cross:V.cross});layout()}
 document.querySelectorAll('#tools button').forEach(b=>b.onclick=()=>tool(b.dataset.t));
 try{const s=JSON.parse(localStorage.xview||'{}');if(s.grid)tool('grid');if(s.cross)tool('cross');if(s.mir)tool('mir');for(let i=0;i<(s.rot||0)/90;i++)tool('rot')}catch(e){}
-addEventListener('keydown',e=>{if(e.target.matches('input,select,textarea'))return;const k=e.key.toLowerCase();
+addEventListener('keydown',e=>{if(e.target.matches('input,select,textarea')||document.body.classList.contains('cmpMode'))return;const k=e.key.toLowerCase();
   if(k==='s')snap();else if(k==='r')toggleRec();else if(k==='f')tool('full');else if(k==='g')tool('grid');else if(k==='c')tool('cross');else if(k==='p')tool('pause');else if(k==='0')tool('fit')});
 
 // ---------- focus helper + histogram (from /frame.jpg) ----------
@@ -389,6 +390,7 @@ async function poll(){const s=await api('/api/state');if(s&&s.pc){P=s.pc;B=s.boa
     const g=$('#recGo');g.classList.toggle('on',!!r);g.textContent=r?'Stop recording':'Start recording';
     $('#recInfo').innerHTML=r?[['File',r.file],['Time',mmss(r.secs)],['Frames',r.frames],['Size',r.mb.toFixed(1)+' MB'],['Frame rate',r.tl?'1 every '+r.tl+' s':r.fps+' fps'],['Sound',r.audio?'yes':'no']].map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join(''):`<span>Folder</span><b title="${P.videos}">${P.videos}</b>`;
     const micOn=B&&B.mic;$('#micState').textContent=micOn?'on':'off';$('#vu').style.width=micOn?Math.min(100,P.level*130)+'%':'0';$('#micHint').textContent=micOn?'Level from the board microphone.':'Turn the mic on in the Record tab.';
+    updCrazy(s.crazy);
     if(P.msg&&P.msg!==poll.msg){if(poll.msg!==undefined)toast(P.msg);poll.msg=P.msg}}
   refresh()}
 TABS.forEach(([id,label,items],i)=>{
@@ -398,6 +400,7 @@ TABS.forEach(([id,label,items],i)=>{
 });
 if(localStorage.xtab){const b=document.querySelector(`#tabs button[data-id="${localStorage.xtab}"]`);if(b)b.click()}
 
+initCompare();
 setInterval(poll,500);poll();
 $('#snapTop').onclick=snap;$('#recBtnTop').onclick=toggleRec;
 $('#quitTop').onclick=async()=>{if(!$('#quitTop').dataset.arm){$('#quitTop').dataset.arm=1;$('#quitTop').textContent='Click to confirm';setTimeout(()=>{delete $('#quitTop').dataset.arm;$('#quitTop').textContent='Quit'},3000);return}

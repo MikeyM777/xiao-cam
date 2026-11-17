@@ -1,0 +1,223 @@
+<style>
+#modeSw{margin-left:4px}#modeSw button{padding:5px 14px}
+body.crazyOn #p_image,body.crazyOn #p_light,body.crazyOn #p_color{pointer-events:none;opacity:.4}
+.lockmsg{display:none;margin:10px 0 0;padding:7px 10px;border-radius:6px;background:#2a210c;border:1px solid #5c4613;color:#fde3a7;font-size:12px}
+body.crazyOn .lockmsg{display:block}
+#cmp{display:none;grid-row:1/3;min-height:0;flex-direction:column;position:relative}
+body.cmpMode #stage,body.cmpMode #bottom{display:none}body.cmpMode #cmp{display:flex}
+#cmpBar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:9px 10px;border-bottom:1px solid var(--ln);background:var(--p)}
+#cmpBar select{width:auto;max-width:230px}#cmpBar label{color:var(--mu);display:flex;align-items:center;gap:5px}
+#cmpBar .seg button{padding:5px 10px;white-space:nowrap}
+#cmpEmpty{display:none;flex:1;align-items:center;justify-content:center;flex-direction:column;gap:6px;color:var(--mu);text-align:center;padding:30px}
+#cmpEmpty b{color:var(--tx);font-size:15px}
+#best{display:flex;gap:8px;padding:10px;overflow-x:auto;border-bottom:1px solid var(--ln);flex:none;scrollbar-width:thin}
+.bestc{flex:none;width:168px;background:var(--bg);border:1px solid var(--ln);border-radius:8px;overflow:hidden;cursor:pointer}
+.bestc:hover{border-color:#3a4250}
+.bestc img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#000}
+.bestc div{padding:5px 8px;font-size:12px;line-height:1.35}.bestc div b{color:#bfd6ff}
+#gridw{flex:1;overflow:auto;padding:10px;scrollbar-width:thin;scrollbar-color:#2a2f37 transparent}
+#cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:8px}
+.cc{position:relative;background:var(--bg);border:1px solid var(--ln);border-radius:8px;overflow:hidden;cursor:pointer}
+.cc:hover{border-color:#3a4250}.cc.sel{outline:2px solid var(--ac);outline-offset:-1px}
+.cc img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#000}
+.cc .ci{padding:5px 8px 7px;font-size:12px}.cc .ci b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cc .ci span{color:var(--mu)}
+.cc .num{position:absolute;left:6px;top:6px;background:var(--ac);color:#fff;border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px}
+.star{position:absolute;right:4px;top:2px;font-size:19px;line-height:1;color:#ffd54a;text-shadow:0 1px 3px #000;cursor:pointer;background:none;border:0;padding:2px 4px}
+.star.off{color:rgba(255,255,255,.55)}
+.sbar{height:4px;background:#20242b;border-radius:2px;margin-top:4px}.sbar i{display:block;height:100%;background:var(--ac);border-radius:2px}
+#tray{display:flex;align-items:center;gap:8px;padding:8px 10px;border-top:1px solid var(--ln);background:var(--p);flex:none}
+#tray img{height:38px;border-radius:4px}#tray .sp{flex:1}
+#cview{position:absolute;inset:0;background:var(--bg);display:none;flex-direction:column;z-index:6}
+#cvBar{display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--ln);background:var(--p)}
+#cvBar button.on{border-color:var(--ac);color:#bfd6ff}
+#cpanes{flex:1;display:grid;gap:6px;padding:6px;min-height:0}
+.cvp{position:relative;overflow:hidden;background:#000;cursor:grab;min-height:0}
+.cvp img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;transform-origin:50% 50%;user-select:none;-webkit-user-drag:none}
+.cvp .tag{position:absolute;left:8px;top:8px;background:rgba(20,23,28,.85);padding:2px 8px;border-radius:5px;font-size:12px;z-index:3}
+.cvp .tag.r{left:auto;right:8px}
+#cinfos{display:grid;gap:6px;padding:0 6px 6px;flex:none;max-height:40vh;overflow:auto}
+.cinfo{background:var(--p);border:1px solid var(--ln);border-radius:8px;padding:8px 10px;font-size:12px;min-width:0}
+.cinfo h5{margin:0 0 5px;font-size:13px;display:flex;align-items:center;gap:8px}
+.cinfo h5 .n{background:var(--ac);color:#fff;border-radius:50%;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;flex:none}
+.cinfo table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}.cinfo td{padding:1px 4px;border-bottom:1px solid #1d2127}
+.cinfo td:last-child{text-align:right}.cinfo tr.d td{color:#ffd54a}.cinfo tr.best td:last-child{color:#4ade80;font-weight:600}
+.cinfo .cols{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}
+.cinfo .btns{margin-top:6px}.cinfo .btns button{padding:4px 9px;font-size:12px}
+.cinfo input{width:130px;padding:3px 6px}
+.wline{position:absolute;top:0;bottom:0;width:2px;background:#fff;z-index:4;cursor:ew-resize;box-shadow:0 0 0 1px rgba(0,0,0,.4)}
+.wline::after{content:"";position:absolute;top:50%;left:-9px;width:20px;height:20px;margin-top:-10px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+</style>
+<script>
+'use strict';
+// ===================== Crazy mode + Compare =====================
+let CZ=null;
+const CX={shots:[],stars:new Set(),sel:[],prof:'daylight',limit:300,z:{z:1,x:0,y:0},wipe:false,wx:50,all:false};
+const PROF={daylight:'Daylight',night:'Night',indoor:'Indoor',fast:'Fast video'};
+const czEnc=p=>'/crazy/file?p='+encodeURIComponent(p);
+const czEsc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const czName=s=>s.mix?'Mix for '+PROF[s.mix]+' #'+parseInt(s.label.split('_').pop(),10):s.group+': '+s.label;
+const czTime=s=>{s=s|0;const m=s/60|0;return m?m+' min '+(s%60)+' s':s+' s'};
+
+function crazyPane(p){
+  p.innerHTML=`<div class="sec">Crazy mode</div>
+  <div class="hint">Shoots the same scene with every setting, nonstop, and saves scored photos in neat folders. Tape the camera down so it always sees the same thing. Your own settings come back when you stop.</div>
+  <div class="field" style="margin-top:10px"><label>Output folder</label><div style="display:flex;gap:6px"><input type="text" id="czDir" spellcheck="false"><button id="czPick">Choose...</button></div></div>
+  <div class="btns" style="margin-top:0"><button id="czSet">Use typed path</button><button id="czOpen">Open folder</button></div>
+  <button id="czGo" class="pri" style="width:100%;padding:11px;font-size:14px;font-weight:600;margin-top:12px">Start crazy mode</button>
+  <div class="meter" style="margin-top:10px"><i id="czBar" style="background:var(--ac)"></i></div>
+  <div class="kv" id="czInfo" style="margin-top:8px"></div>
+  <div class="sec">Last shot</div>
+  <img id="czLast" alt="" style="width:100%;border-radius:6px;display:none;background:#000">
+  <div class="kv" id="czScores" style="margin-top:6px"></div>
+  <button id="czCmp" style="width:100%;margin-top:12px">Open Compare</button>
+  <div class="sec">One round</div>
+  <div class="hint">1. Light probe (day / dim / night). 2. Sweep: every value of every setting, one at a time (~95 photos). 3. Mix: for each need (daylight, night, indoor, fast video) the 4 settings that mattered most, best 2 values each, all combinations. About 8-10 min per round, then the next round starts.</div>`;
+  const dir=p.querySelector('#czDir');dir.addEventListener('input',()=>dir.dataset.dirty=1);
+  p.querySelector('#czPick').onclick=async()=>{toast('A folder window opened - it may be behind the browser');const r=await api('/api/crazy/folder?pick=1');if(r.ok){delete dir.dataset.dirty;dir.value=r.dir;toast('Folder: '+r.dir)}else if(r.err!=='cancelled')toast(r.err||'Could not set the folder')};
+  p.querySelector('#czSet').onclick=async()=>{const r=await api('/api/crazy/folder?path='+encodeURIComponent(dir.value));if(r.ok){delete dir.dataset.dirty;dir.value=r.dir;toast('Folder: '+r.dir)}else toast(r.err||'Bad folder')};
+  p.querySelector('#czOpen').onclick=()=>api('/api/crazy/open');
+  p.querySelector('#czGo').onclick=async()=>{if(CZ&&CZ.running){await api('/api/crazy/stop');toast('Stopping - putting your settings back...');return}
+    const r=await api('/api/crazy/start');toast(r.ok?'Crazy mode started':'Could not start: '+(r.err||''))};
+  p.querySelector('#czCmp').onclick=()=>setMode('cmp');
+  ['p_image','p_light','p_color'].forEach(id=>{const pane=document.getElementById(id);if(pane){const m=el('div','lockmsg','Crazy mode is running - settings are locked. Stop it in the Crazy tab.');pane.prepend(m)}});
+}
+
+function updCrazy(c){CZ=c;if(!c)return;
+  document.body.classList.toggle('crazyOn',!!c.running);
+  const g=$('#czGo');if(!g)return;
+  g.textContent=c.running?'Stop crazy mode':'Start crazy mode';g.classList.toggle('pri',!c.running);g.classList.toggle('danger',!!c.running);
+  const d=$('#czDir');if(d&&!d.dataset.dirty&&document.activeElement!==d)d.value=c.dir||'';
+  $('#czBar').style.width=c.running&&c.total?Math.min(100,c.shot/c.total*100)+'%':'0';
+  const rows=c.running?[['State',c.phase],['Round',c.round||'-'],['Light',c.light||'-'],['Shot',c.shot+' of '+c.total],['Testing now',c.current||'-'],['Round ends in','~'+czTime(c.eta)],['Rounds done',c.roundsDone]]
+    :[['State',c.phase==='idle'?'stopped':c.phase],['Rounds done this run',c.roundsDone]];
+  if(c.err)rows.push(['Last error',c.err]);
+  $('#czInfo').innerHTML=rows.map(([a,b])=>`<span>${a}</span><b title="${czEsc(b)}">${czEsc(b)}</b>`).join('');
+  const li=$('#czLast');if(c.last&&li.dataset.p!==c.last){li.dataset.p=c.last;li.src=czEnc(c.last);li.style.display='block'}
+  const s=c.scores;$('#czScores').innerHTML=s?[['Size',s.w+' x '+s.h],['Sharpness',s.sharp],['Noise',s.noise],['Brightness',Math.round(s.mean*100)+'%'],['Clipped',(s.clip*100).toFixed(1)+'%'],['FPS',s.fps],['File',s.kb+' KB']].map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join(''):'';
+  if(c.running){$('#stat').textContent='CRAZY MODE - shot '+c.shot+' of '+c.total+' - '+(c.current||c.phase)}
+}
+
+// ---------- compare: data ----------
+function setMode(m){document.body.classList.toggle('cmpMode',m==='cmp');document.querySelectorAll('#modeSw button').forEach(b=>b.classList.toggle('on',b.dataset.m===m));
+  if(m==='cmp')loadLib();else{closeView();layout()}}
+async function loadLib(){
+  const r=await api('/api/crazy/rounds');const shots=[];
+  if(r.ok)for(const id of r.rounds){const j=await api('/api/crazy/round?id='+encodeURIComponent(id));if(!j||!j.shots)continue;
+    j.shots.forEach(s=>{s.round=id;s.light=j.light;s.rnum=j.round;shots.push(s)})}
+  const st=await api('/api/crazy/stars');CX.stars=new Set(Array.isArray(st)?st:[]);
+  CX.shots=shots;CX.rounds=r.ok?r.rounds:[];CX.dir=r.dir||'';
+  const keep=new Set(CX.sel.map(s=>s.file));CX.sel=shots.filter(s=>keep.has(s.file));
+  fillFilters();cmpRender()}
+function fillFilters(){
+  const opt=(sel,list,all)=>{const s=$(sel),v=s.value;s.innerHTML=`<option value="">${all}</option>`+list.map(x=>`<option value="${czEsc(x[0])}">${czEsc(x[1])}</option>`).join('');if([...s.options].some(o=>o.value===v))s.value=v};
+  opt('#fRound',CX.rounds.slice().reverse().map(r=>[r,r.replace(/_/g,' ')]),'All rounds');
+  opt('#fLight',['day','dim','night'].filter(l=>CX.shots.some(s=>s.light===l)).map(l=>[l,l]),'All light');
+  const gs=[...new Set(CX.shots.map(s=>s.group))].sort();opt('#fGroup',gs.map(g=>[g,g]),'All settings');
+}
+function filtered(){const r=$('#fRound').value,l=$('#fLight').value,g=$('#fGroup').value,st=$('#fStar').checked;
+  return CX.shots.filter(s=>(!r||s.round===r)&&(!l||s.light===l)&&(!g||s.group===g)&&(!st||CX.stars.has(s.file)))}
+// same formula as the PC engine (XScore.Rank); noise is judged relative to brightness
+function rank(list,prof){const n=list.length,o=new Map();if(!n)return o;
+  const nm=f=>{let mn=Infinity,mx=-Infinity;list.forEach(s=>{const v=f(s.scores);mn=Math.min(mn,v);mx=Math.max(mx,v)});return list.map(s=>mx-mn<1e-9?.5:(f(s.scores)-mn)/(mx-mn))};
+  const sh=nm(x=>x.sharp),no=nm(x=>x.noise/Math.max(x.mean,.05)),cl=nm(x=>x.clip),ca=nm(x=>x.cast),fp=nm(x=>x.fps);
+  list.forEach((s,i)=>{const ex=Math.max(0,1-Math.abs(s.scores.mean-.45)/.45);let v;
+    if(prof==='daylight')v=.35*sh[i]+.25*ex+.15*(1-ca[i])+.15*(1-no[i])+.10*(1-cl[i]);
+    else if(prof==='night')v=.35*ex+.30*(1-no[i])+.20*sh[i]+.15*(1-cl[i]);
+    else if(prof==='indoor')v=.30*ex+.25*(1-ca[i])+.25*sh[i]+.20*(1-no[i]);
+    else v=.50*fp[i]+.20*sh[i]+.20*ex+.10*(1-no[i]);v*=.4+.6*Math.min(1,ex/.6);o.set(s,v)});return o}
+
+// ---------- compare: grid ----------
+function cmpRender(){
+  const list=filtered();const has=CX.shots.length>0;
+  $('#cmpEmpty').style.display=has?'none':'flex';$('#best').style.display=has?'flex':'none';$('#gridw').style.display=has?'block':'none';
+  $('#cmpCount').textContent=has?list.length+' of '+CX.shots.length+' photos':'';
+  const sc=rank(list,CX.prof),srt=$('#fSort').value;
+  const key={score:s=>-sc.get(s),sharp:s=>-s.scores.sharp,noise:s=>s.scores.noise,bright:s=>-s.scores.mean,fps:s=>-s.scores.fps,kb:s=>s.scores.kb,time:s=>-(Date.parse(s.time)||0)}[srt];
+  const sorted=list.slice().sort((a,b)=>key(a)-key(b));
+  // best per need, per light level
+  const best=$('#best');best.innerHTML='';
+  const lights=['day','dim','night'].filter(l=>list.some(s=>s.light===l));
+  Object.keys(PROF).forEach(p=>lights.forEach(l=>{const sub=list.filter(s=>s.light===l);const r=rank(sub,p);let b=null,bv=-1;sub.forEach(s=>{if(r.get(s)>bv){bv=r.get(s);b=s}});if(!b)return;
+    const c=el('div','bestc',`<img loading="lazy" src="${czEnc(b.thumb)}" alt=""><div><b>${PROF[p]}</b> &middot; ${l}<br>${czEsc(czName(b))}</div>`);c.title='Best for '+PROF[p]+' in '+l+' light - click to select';c.onclick=()=>toggleSel(b);best.appendChild(c)}));
+  const g=$('#cgrid');g.innerHTML='';
+  sorted.slice(0,CX.limit).forEach(s=>{const v=sc.get(s)||0;const i=CX.sel.indexOf(s);
+    const c=el('div','cc'+(i>=0?' sel':''),`<img loading="lazy" src="${czEnc(s.thumb)}" alt="">${i>=0?`<span class="num">${i+1}</span>`:''}
+      <button class="star${CX.stars.has(s.file)?'':' off'}" title="Star">${CX.stars.has(s.file)?'&#9733;':'&#9734;'}</button>
+      <div class="ci"><b>${czEsc(czName(s))}</b><span>R${s.rnum} &middot; ${s.light} &middot; ${s.scores.w}x${s.scores.h} &middot; ${s.scores.fps} fps</span><div class="sbar"><i style="width:${(v*100).toFixed(0)}%"></i></div></div>`);
+    c.onclick=()=>toggleSel(s);c.querySelector('.star').onclick=e=>{e.stopPropagation();starToggle(s)};g.appendChild(c)});
+  $('#more').style.display=sorted.length>CX.limit?'inline-block':'none';
+  drawTray()}
+function toggleSel(s){const i=CX.sel.indexOf(s);if(i>=0)CX.sel.splice(i,1);else{if(CX.sel.length>=4)CX.sel.shift();CX.sel.push(s)}cmpRender()}
+async function starToggle(s){const on=!CX.stars.has(s.file);const r=await api('/api/crazy/star?p='+encodeURIComponent(s.file)+'&on='+(on?1:0));
+  if(!r.ok){toast('Could not save the star');return}if(on)CX.stars.add(s.file);else CX.stars.delete(s.file);cmpRender();if($('#cview').style.display==='flex')openView()}
+function drawTray(){const t=$('#trayImgs');t.innerHTML=CX.sel.map(s=>`<img src="${czEnc(s.thumb)}" alt="" title="${czEsc(czName(s))}">`).join('');
+  $('#trayTxt').textContent=CX.sel.length?CX.sel.length+' selected':'Click photos to pick 2-4 to compare';
+  $('#goCmp').disabled=CX.sel.length<2;$('#goCmp').textContent='Compare ('+CX.sel.length+')'}
+
+// ---------- compare: side by side ----------
+const SKEYS=()=>SENSOR_KEYS;
+const SNAME={framesize:'Resolution',quality:'JPEG quality',fps_limit:'FPS limit',brightness:'Brightness',contrast:'Contrast',saturation:'Saturation',sharpness:'Sharpness',denoise:'Denoise',effect:'Effect',awb:'Auto WB',awb_gain:'WB gain',wb_mode:'WB mode',aec:'Auto exposure',aec2:'Exposure DSP',ae_level:'Exposure comp',aec_value:'Manual exposure',agc:'Auto gain',agc_gain:'Manual gain',gainceiling:'Max gain',bpc:'Black pixel fix',wpc:'White pixel fix',raw_gma:'Gamma',lenc:'Lens correction',hmirror:'Mirror',vflip:'Flip',dcw:'Downscale',xclk:'Clock MHz'};
+function sval(s,k){const v=s.set[k];if(v===undefined)return'-';if(k==='framesize')return s.scores.w+'x'+s.scores.h;if(k==='wb_mode')return['Auto','Sunny','Cloudy','Office','Home'][v]||v;if(k==='gainceiling')return(2<<v)+'x';if(k==='agc_gain')return(v+1)+'x';
+  if(['awb','awb_gain','aec','aec2','agc','bpc','wpc','raw_gma','lenc','hmirror','vflip','dcw'].includes(k))return v?'on':'off';return v}
+function openView(){const sel=CX.sel;if(sel.length<2){toast('Pick at least 2 photos');return}
+  const v=$('#cview');v.style.display='flex';const wipe=CX.wipe&&sel.length===2;
+  $('#cvWipe').style.display=sel.length===2?'':'none';$('#cvWipe').classList.toggle('on',wipe);$('#cvAll').classList.toggle('on',CX.all);
+  const panes=$('#cpanes');panes.innerHTML='';panes.style.gridTemplateColumns=wipe?'1fr':`repeat(${sel.length},1fr)`;
+  if(wipe){const p=el('div','cvp');p.innerHTML=`<img src="${czEnc(sel[0].file)}" alt=""><img class="wtop" src="${czEnc(sel[1].file)}" alt=""><span class="tag">1</span><span class="tag r">2</span><div class="wline"></div>`;panes.appendChild(p);wireView(p,true)}
+  else sel.forEach((s,i)=>{const p=el('div','cvp');p.innerHTML=`<img src="${czEnc(s.file)}" alt=""><span class="tag">${i+1}</span>`;panes.appendChild(p);wireView(p,false)});
+  zoomApply();
+  // info
+  const infos=$('#cinfos');infos.style.gridTemplateColumns=`repeat(${sel.length},1fr)`;infos.innerHTML='';
+  const diff=SKEYS().filter(k=>new Set(sel.map(s=>String(s.set[k]))).size>1);const keys=CX.all?SKEYS():diff;
+  const prof=Object.keys(PROF).map(p=>[p,rank(sel,p)]);
+  const met=[['Sharpness','sharp',1],['Noise','noise',-1],['Brightness','mean',0],['Clipped','clip',-1],['Color cast','cast',-1],['FPS','fps',1],['File KB','kb',-1]];
+  sel.forEach((s,i)=>{const c=el('div','cinfo');
+    const bestOf=(k,dir)=>{const vals=sel.map(x=>x.scores[k]);const b=dir>0?Math.max(...vals):Math.min(...vals);return s.scores[k]===b};
+    const mrows=met.map(([n,k,d])=>{const v=k==='mean'?Math.round(s.scores.mean*100)+'%':k==='clip'?(s.scores.clip*100).toFixed(1)+'%':s.scores[k];return`<tr class="${d&&bestOf(k,d)?'best':''}"><td>${n}</td><td>${v}</td></tr>`}).join('')
+      +prof.map(([p,r])=>{const mx=Math.max(...sel.map(x=>r.get(x)));const v=r.get(s);return`<tr class="${v===mx?'best':''}"><td>${PROF[p]} score</td><td>${Math.round(v*100)}</td></tr>`}).join('');
+    const srows=keys.length?keys.map(k=>`<tr class="${diff.includes(k)?'d':''}"><td>${SNAME[k]||k}</td><td>${czEsc(sval(s,k))}</td></tr>`).join(''):'<tr><td colspan="2">Same settings</td></tr>';
+    c.innerHTML=`<h5><span class="n">${i+1}</span>${czEsc(czName(s))}</h5><div class="hint" style="margin:0 0 6px">${czEsc(s.round)} &middot; ${s.light}${s.from?' &middot; mix of '+czEsc(s.from.join(', ')):''}</div>
+      <div class="cols"><table>${srows}</table><table>${mrows}</table></div>
+      <div class="btns"><button class="st">${CX.stars.has(s.file)?'&#9733; Starred':'&#9734; Star'}</button><button class="ap pri">Apply to camera</button><input type="text" placeholder="Profile name"><button class="sv">Save as profile</button></div>`;
+    c.querySelector('.st').onclick=()=>starToggle(s);
+    c.querySelector('.ap').onclick=()=>{if(CZ&&CZ.running){toast('Stop crazy mode first');return}applySet(s.set);toast('Applied to the camera: '+czName(s))};
+    c.querySelector('.sv').onclick=()=>{const n=c.querySelector('input').value.trim();if(!n){toast('Type a profile name');return}const P_=profs();const o={};SENSOR_KEYS.forEach(k=>{if(s.set[k]!==undefined)o[k]=s.set[k]});P_[n]=o;localStorage.xprof=JSON.stringify(P_);if($('#profList'))drawProfs();toast('Profile saved: '+n)};
+    infos.appendChild(c)})}
+function closeView(){const v=$('#cview');if(v)v.style.display='none'}
+function zoomApply(){const z=CX.z;document.querySelectorAll('#cpanes img').forEach(i=>i.style.transform=`translate(${z.x}px,${z.y}px) scale(${z.z})`);
+  document.querySelectorAll('#cpanes .wtop').forEach(i=>i.style.clipPath=`inset(0 0 0 ${CX.wx}%)`);document.querySelectorAll('#cpanes .wline').forEach(l=>l.style.left=CX.wx+'%')}
+function wireView(p,wipe){
+  p.addEventListener('wheel',e=>{e.preventDefault();const f=e.deltaY<0?1.2:1/1.2,z=CX.z,nz=Math.min(12,Math.max(1,z.z*f));const r=p.getBoundingClientRect();const cx=e.clientX-r.left-r.width/2,cy=e.clientY-r.top-r.height/2;
+    z.x=cx-(cx-z.x)*nz/z.z;z.y=cy-(cy-z.y)*nz/z.z;z.z=nz;if(nz===1){z.x=0;z.y=0}zoomApply()},{passive:false});
+  p.addEventListener('mousedown',e=>{e.preventDefault();CX.drag=wipe&&e.target.classList.contains('wline')?{p,wipe:true}:{p,x:e.clientX-CX.z.x,y:e.clientY-CX.z.y}});
+  p.addEventListener('dblclick',()=>{CX.z={z:1,x:0,y:0};zoomApply()})}
+
+function initCompare(){
+  const sw=el('div','seg');sw.id='modeSw';sw.innerHTML='<button data-m="live" class="on">Live</button><button data-m="cmp">Compare</button>';
+  document.querySelector('.brand').after(sw);sw.querySelectorAll('button').forEach(b=>b.onclick=()=>setMode(b.dataset.m));
+  const c=el('div');c.id='cmp';c.innerHTML=`<div id="cmpBar">
+    <div class="seg" id="fProf">${Object.entries(PROF).map(([k,v])=>`<button data-p="${k}"${k===CX.prof?' class="on"':''}>${v}</button>`).join('')}</div>
+    <select id="fRound"></select><select id="fLight"></select><select id="fGroup"></select>
+    <select id="fSort"><option value="score">Sort: best for the need</option><option value="sharp">Sort: sharpest</option><option value="noise">Sort: least noise</option><option value="bright">Sort: brightest</option><option value="fps">Sort: highest fps</option><option value="kb">Sort: smallest file</option><option value="time">Sort: newest</option></select>
+    <label><input type="checkbox" id="fStar"> Starred only</label><span class="sp"></span><span id="cmpCount" style="color:var(--mu)"></span><button id="cmpReload">Reload</button></div>
+    <div id="cmpEmpty"><b>No crazy-mode photos yet</b><span>Start crazy mode in the Crazy tab. Photos appear here as they are taken (press Reload).</span></div>
+    <div id="best"></div>
+    <div id="gridw"><div id="cgrid"></div><div style="text-align:center;margin:12px"><button id="more">Show more</button></div></div>
+    <div id="tray"><span id="trayImgs" style="display:flex;gap:6px"></span><span id="trayTxt" style="color:var(--mu)"></span><span class="sp"></span><button id="selClr">Clear</button><button id="goCmp" class="pri" disabled>Compare (0)</button></div>
+    <div id="cview"><div id="cvBar"><button id="cvBack">&larr; Back to all photos</button><button id="cvWipe" title="Drag the white line">A/B wipe</button><button id="cvAll">Show all settings</button><button id="cvFit">Reset zoom</button>
+      <span class="hint" style="margin:0 0 0 6px">Mouse wheel = zoom all together, drag = move. Yellow = settings that differ, green = best value.</span></div>
+      <div id="cpanes"></div><div id="cinfos"></div></div>`;
+  $('#left').appendChild(c);
+  c.querySelectorAll('#fProf button').forEach(b=>b.onclick=()=>{CX.prof=b.dataset.p;c.querySelectorAll('#fProf button').forEach(x=>x.classList.toggle('on',x===b));cmpRender()});
+  ['#fRound','#fLight','#fGroup','#fSort','#fStar'].forEach(s=>c.querySelector(s).onchange=()=>{CX.limit=300;cmpRender()});
+  c.querySelector('#cmpReload').onclick=loadLib;c.querySelector('#more').onclick=()=>{CX.limit+=300;cmpRender()};
+  c.querySelector('#selClr').onclick=()=>{CX.sel=[];cmpRender()};c.querySelector('#goCmp').onclick=()=>{CX.z={z:1,x:0,y:0};openView()};
+  c.querySelector('#cvBack').onclick=closeView;c.querySelector('#cvWipe').onclick=()=>{CX.wipe=!CX.wipe;openView()};
+  c.querySelector('#cvAll').onclick=()=>{CX.all=!CX.all;openView()};c.querySelector('#cvFit').onclick=()=>{CX.z={z:1,x:0,y:0};zoomApply()};
+  addEventListener('keydown',e=>{if(e.key==='Escape')closeView()});
+  addEventListener('mousemove',e=>{const d=CX.drag;if(!d)return;if(d.wipe){const r=d.p.getBoundingClientRect();CX.wx=Math.max(0,Math.min(100,(e.clientX-r.left)/r.width*100))}else{CX.z.x=e.clientX-d.x;CX.z.y=e.clientY-d.y}zoomApply()});
+  addEventListener('mouseup',()=>{CX.drag=null});
+  setInterval(()=>{if(document.body.classList.contains('cmpMode')&&CZ&&CZ.running&&$('#cview').style.display!=='flex'&&!document.hidden)loadLib()},20000);
+}
+</script>

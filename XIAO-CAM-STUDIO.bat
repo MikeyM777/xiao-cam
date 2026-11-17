@@ -83,7 +83,7 @@ static String apSsid = "@@SSID@@", apPass = "@@PASS@@", staSsid = "", staPass = 
 static volatile int capFrames = 0, streamClients = 0;
 static float capFps = 0, usbFps = 0;
 static int usbFrames = 0;
-static bool dirty = false, cfgNow = true, webStarted = false;
+static bool dirty = false, cfgNow = true, webStarted = false, autosave = true;
 static uint32_t dirtyAt = 0;
 static volatile bool micRunning = false, micBusy = false;
 
@@ -175,7 +175,7 @@ static void saveAll() {
   prefs.end();
   dirty = false;
 }
-static void markDirty() { dirty = true; dirtyAt = millis(); }
+static void markDirty() { if (autosave) { dirty = true; dirtyAt = millis(); } }
 
 // ---------- camera ----------
 static bool camInitSize(framesize_t fs) {
@@ -414,7 +414,8 @@ static void sendAudio() {
 }
 
 static void setValue(const char* k, int v) {
-  if (!strcmp(k, "fps_limit")) fpsLimit = constrain(v, 0, 60);
+  if (!strcmp(k, "autosave")) autosave = v != 0;   // PC crazy mode turns this off: no flash wear
+  else if (!strcmp(k, "fps_limit")) fpsLimit = constrain(v, 0, 60);
   else if (!strcmp(k, "xclk")) {
     xclkMhz = constrain(v, 4, 24);
     if (camOk) { sensor_t* s = esp_camera_sensor_get(); if (s->set_xclk) s->set_xclk(s, LEDC_TIMER_0, xclkMhz); }
@@ -548,13 +549,19 @@ public class XHub {
   public volatile float Level;
   public DateTime LastCfgAt = DateTime.MinValue, LastFrameAt = DateTime.MinValue;
   readonly object fl = new object(), sl = new object(), rl = new object();
-  byte[] frame; long seq; int fw, fh;
+  byte[] frame; long seq; int fw, fh; DateTime frameAt;
+  public XCrazy Crazy;
+  public bool IsLive { get { return (DateTime.Now - LastFrameAt).TotalSeconds < 2; } }
+  public long TotalFrames { get { return Interlocked.Read(ref totalFrames); } }
+  public byte[] LatestWithTime(out DateTime at, out int w, out int h) { lock (fl) { at = frameAt; w = fw; h = fh; return frame; } }
   int winFrames; long winBytes; double fps, kbps;
   float peak; int peakN;
   long totalFrames;
   volatile bool shutdown;
 
-  public void StartAll() {
+  public void StartAll(string crazyDefault) {
+    Crazy = new XCrazy(this);
+    Crazy.LoadDir(crazyDefault);
     StartSource();
     var t = new Thread(TickLoop); t.IsBackground = true; t.Start();
   }
@@ -577,8 +584,9 @@ public class XHub {
   public void OnFrame(byte[] jpg) {
     int w, h;
     XJpeg.Size(jpg, out w, out h);
-    lock (fl) { frame = jpg; seq++; fw = w; fh = h; Monitor.PulseAll(fl); }
-    LastFrameAt = DateTime.Now; totalFrames++;
+    DateTime now = DateTime.Now;
+    lock (fl) { frame = jpg; seq++; fw = w; fh = h; frameAt = now; Monitor.PulseAll(fl); }
+    LastFrameAt = now; Interlocked.Increment(ref totalFrames);
     lock (sl) { winFrames++; winBytes += jpg.Length; }
     XAvi r = Rec;
     if (r != null) { try { r.AddVideo(jpg, w, h); } catch (Exception e) { LastMsg = "recording error: " + e.Message; StopRec(); } }
@@ -637,6 +645,7 @@ public class XHub {
   }
   public void Shutdown() {
     shutdown = true;
+    XCrazy cz = Crazy; if (cz != null) cz.StopAndWait(8000);
     StopRec();
     IXSource s = Source; if (s != null) s.Stop();
   }
@@ -689,7 +698,8 @@ public class XHub {
       sb.Append(",\"tl\":").Append(N(r.TlSec));
       sb.Append(",\"part\":").Append(r.Part).Append("}");
     } else sb.Append(",\"rec\":null");
-    sb.Append("},\"board\":");
+    sb.Append("},\"crazy\":").Append(Crazy == null ? "null" : Crazy.StateJson());
+    sb.Append(",\"board\":");
     string b = BoardJson;
     sb.Append(string.IsNullOrEmpty(b) ? "null" : b);
     sb.Append("}");
@@ -911,7 +921,11 @@ public class XDemo : IXSource {
         }
       } else audioDone = (long)(t * 16000);
       int fl = Get("fps_limit");
-      double period = 1.0 / (fl > 0 ? Math.Min(fl, 25) : 20);
+      int dfs = Get("framesize");
+      double dfps = 25 * Math.Pow(480000.0 / (SW[dfs] * SH[dfs]), 0.7) * Math.Pow(Math.Max(4, Get("quality")) / 10.0, 0.3) * Get("xclk") / 20.0;
+      dfps = Math.Max(2, Math.Min(25, dfps));
+      if (fl > 0) dfps = Math.Min(dfps, fl);
+      double period = 1.0 / dfps;
       if (t >= nextFrame && Get("usb") == 1) {
         nextFrame = t + period;
         try { hub.OnFrame(Render(t, jpg)); fpsN++; } catch (Exception e) { hub.OnMsg("demo: " + e.Message); }
@@ -921,7 +935,7 @@ public class XDemo : IXSource {
   }
   public byte[] Render(double t, ImageCodecInfo codec) {
     int fs = Get("framesize"); int w = SW[fs], h = SH[fs];
-    int br = Get("brightness"), sat = Get("saturation");
+    int br = 0, sat = 0;
     using (var bmp = new Bitmap(w, h, PixelFormat.Format24bppRgb))
     using (var g = Graphics.FromImage(bmp)) {
       g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -946,6 +960,34 @@ public class XDemo : IXSource {
       using (var tb = new SolidBrush(Color.White)) {
         g.DrawString("DEMO  " + w + "x" + h + "  q" + Get("quality"), font, tb, w * 0.03f, h * 0.04f);
         g.DrawString(DateTime.Now.ToString("HH:mm:ss.f"), font, tb, w * 0.03f, h * 0.04f + fsz * 1.6f);
+      }
+      // camera model: exposure, gain, noise, color
+      double lum;
+      if (Get("aec") == 1) lum = 0.45 + Get("ae_level") * 0.08 + (Get("aec2") == 1 ? 0.03 : 0);
+      else lum = 0.55 * Get("aec_value") / 400.0 * (Get("agc") == 1 ? 1 + Get("gainceiling") * 0.3 : Get("agc_gain") + 1);
+      lum += Get("brightness") * 0.05;
+      float k = (float)(lum / 0.45), ct = 1 + Get("contrast") * 0.15f, st = Get("effect") == 2 ? 0 : 1 + Get("saturation") * 0.25f;
+      float tr = 0, tbl = 0; int wm = Get("wb_mode");
+      if (Get("awb") == 0) tbl = 0.08f; else if (Get("awb_gain") == 1) { if (wm == 1) tr = 0.05f; else if (wm == 2) tr = 0.08f; else if (wm == 3) tbl = 0.05f; else if (wm == 4) tr = 0.1f; }
+      float lr = 0.299f, lg = 0.587f, lb = 0.114f;
+      float a = (1 - st) * lr, b2 = (1 - st) * lg, c2 = (1 - st) * lb;
+      var cm = new ColorMatrix(new float[][] {
+        new float[] { (a + st) * k * ct, a * k * ct, a * k * ct, 0, 0 },
+        new float[] { b2 * k * ct, (b2 + st) * k * ct, b2 * k * ct, 0, 0 },
+        new float[] { c2 * k * ct, c2 * k * ct, (c2 + st) * k * ct, 0, 0 },
+        new float[] { 0, 0, 0, 1, 0 },
+        new float[] { 0.5f * (1 - ct) + tr, 0.5f * (1 - ct), 0.5f * (1 - ct) + tbl, 0, 1 } });
+      using (var src = (Bitmap)bmp.Clone())
+      using (var ia = new ImageAttributes()) {
+        ia.SetColorMatrix(cm);
+        g.DrawImage(src, new Rectangle(0, 0, w, h), 0, 0, w, h, GraphicsUnit.Pixel, ia);
+      }
+      double noise = (Get("agc") == 1 ? Get("gainceiling") * 0.02 : Get("agc_gain") * 0.015) * (1 - Get("denoise") / 10.0);
+      if (noise > 0) {
+        var rnd = new Random();
+        int nd = (int)(noise * w * h / 6);
+        using (var nb = new SolidBrush(Color.Black))
+          for (int i = 0; i < nd; i++) { int gv = rnd.Next(256); nb.Color = Color.FromArgb(150, gv, gv, gv); g.FillRectangle(nb, rnd.Next(w), rnd.Next(h), 2, 2); }
       }
       if (Get("hmirror") == 1) bmp.RotateFlip(RotateFlipType.RotateNoneFlipX);
       if (Get("vflip") == 0) bmp.RotateFlip(RotateFlipType.RotateNoneFlipY);
@@ -1218,6 +1260,40 @@ public class XWeb {
         else { Json(ns, Ok(false, null)); return; }
         hub.StartSource(); Json(ns, Ok(true, null)); return;
       }
+      case "/api/crazy/start":
+        try { hub.Crazy.Quick = G(q, "quick") == "1"; hub.Crazy.MaxRounds = (int)D(q, "rounds", 0); hub.Crazy.Start(); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/crazy/stop": hub.Crazy.Stop(); Json(ns, Ok(true, null)); return;
+      case "/api/crazy/folder":
+        try {
+          string d = G(q, "pick") == "1" ? XCrazy.PickFolder(hub.Crazy.OutDir) : G(q, "path");
+          if (d == null) { Json(ns, Ok(false, "\"err\":\"cancelled\"")); return; }
+          d = hub.Crazy.SetDir(d.Trim());
+          Json(ns, Ok(true, "\"dir\":\"" + XHub.Esc(d) + "\""));
+        } catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/crazy/open":
+        try { Directory.CreateDirectory(hub.Crazy.OutDir); Process.Start("explorer.exe", "\"" + hub.Crazy.OutDir + "\""); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/crazy/rounds": Json(ns, hub.Crazy.RoundsJson()); return;
+      case "/api/crazy/round": {
+        string j = hub.Crazy.RoundJson(G(q, "id"));
+        if (j == null) Send(ns, "404 Not Found", "application/json", Encoding.ASCII.GetBytes("{\"ok\":false}")); else Json(ns, j);
+        return;
+      }
+      case "/api/crazy/stars": Json(ns, XCrazy.Js().Serialize(hub.Crazy.Stars())); return;
+      case "/api/crazy/star":
+        try { hub.Crazy.Star(G(q, "p"), G(q, "on") == "1"); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/crazy/file": {
+        string f = hub.Crazy.SafeFile(G(q, "p"));
+        if (f == null) Send(ns, "403 Forbidden", "text/plain", Encoding.ASCII.GetBytes("no"));
+        else Send(ns, "200 OK", "image/jpeg", File.ReadAllBytes(f));
+        return;
+      }
       case "/api/quit": {
         Json(ns, Ok(true, null));
         var t = new Thread(delegate() { Thread.Sleep(300); hub.Shutdown(); Environment.Exit(0); });
@@ -1242,6 +1318,501 @@ public class XWeb {
       byte[] ph = Encoding.ASCII.GetBytes("--xframe\r\nContent-Type: image/jpeg\r\nContent-Length: " + f.Length + "\r\n\r\n");
       ns.Write(ph, 0, ph.Length); ns.Write(f, 0, f.Length); ns.Write(new byte[] { 13, 10 }, 0, 2);
     }
+  }
+}
+
+// ============================================================================
+//  Crazy mode: nonstop settings sweep -> organized, scored photos
+// ============================================================================
+public class XStopEx : Exception { }
+
+public class XShot {
+  public string Group, Label, Phase, Mix;
+  public Dictionary<string, int> Set = new Dictionary<string, int>();
+  public List<string> From = new List<string>();
+  public XShot(string phase, string group, string label) { Phase = phase; Group = group; Label = label; }
+  public XShot S(string k, int v) { Set[k] = v; return this; }
+}
+
+public class XScores {
+  public double Sharp, Noise, Mean, Clip, Cast, Kb, Fps; public int W, H;
+  public Dictionary<string, object> ToDict() {
+    var d = new Dictionary<string, object>();
+    d["sharp"] = Math.Round(Sharp, 2); d["noise"] = Math.Round(Noise, 3); d["mean"] = Math.Round(Mean, 4);
+    d["clip"] = Math.Round(Clip, 4); d["cast"] = Math.Round(Cast, 4); d["kb"] = Math.Round(Kb, 1);
+    d["fps"] = Math.Round(Fps, 1); d["w"] = W; d["h"] = H;
+    return d;
+  }
+}
+
+public static class XScore {
+  // decodes the JPEG once: scores on a 640 px copy, plus a 320 px thumbnail
+  public static XScores Compute(byte[] jpg, out byte[] thumb) {
+    var s = new XScores(); s.Kb = jpg.Length / 1024.0;
+    using (var ms = new MemoryStream(jpg))
+    using (var src = Image.FromStream(ms)) {
+      s.W = src.Width; s.H = src.Height;
+      int W = Math.Min(640, src.Width), H = Math.Max(1, (int)Math.Round((double)src.Height * W / src.Width));
+      using (var bmp = new Bitmap(W, H, PixelFormat.Format24bppRgb)) {
+        using (var g = Graphics.FromImage(bmp)) { g.InterpolationMode = InterpolationMode.HighQualityBilinear; g.DrawImage(src, 0, 0, W, H); }
+        Analyse(bmp, s);
+        int tw = Math.Min(320, W), th = Math.Max(1, H * tw / W);
+        using (var tb = new Bitmap(tw, th, PixelFormat.Format24bppRgb)) {
+          using (var g = Graphics.FromImage(tb)) { g.InterpolationMode = InterpolationMode.HighQualityBilinear; g.DrawImage(bmp, 0, 0, tw, th); }
+          using (var to = new MemoryStream()) { tb.Save(to, ImageFormat.Jpeg); thumb = to.ToArray(); }
+        }
+      }
+    }
+    return s;
+  }
+
+  static void Analyse(Bitmap bmp, XScores s) {
+    int W = bmp.Width, H = bmp.Height;
+    var data = bmp.LockBits(new Rectangle(0, 0, W, H), ImageLockMode.ReadOnly, PixelFormat.Format24bppRgb);
+    byte[] px = new byte[data.Stride * H];
+    Marshal.Copy(data.Scan0, px, 0, px.Length);
+    bmp.UnlockBits(data);
+    float[] gy = new float[W * H];
+    double sr = 0, sg = 0, sb = 0, sum = 0; long clip = 0;
+    for (int y = 0; y < H; y++) {
+      int row = y * data.Stride;
+      for (int x = 0; x < W; x++) {
+        int i = row + x * 3; byte b = px[i], g = px[i + 1], r = px[i + 2];
+        float v = (r * 77 + g * 150 + b * 29) / 256f;
+        gy[y * W + x] = v; sum += v; sr += r; sg += g; sb += b;
+        if (v < 5 || v > 250) clip++;
+      }
+    }
+    double n = (double)W * H;
+    s.Mean = sum / n / 255.0; s.Clip = clip / n;
+    s.Cast = (Math.Abs(sr - sg) + Math.Abs(sb - sg)) / n / 255.0;
+    // sharpness: variance of the laplacian in the middle third
+    double l1 = 0, l2 = 0; long c = 0;
+    for (int y = Math.Max(1, H / 3); y < Math.Min(H - 1, 2 * H / 3); y++)
+      for (int x = Math.Max(1, W / 3); x < Math.Min(W - 1, 2 * W / 3); x++) {
+        int i = y * W + x; double L = 4 * gy[i] - gy[i - 1] - gy[i + 1] - gy[i - W] - gy[i + W];
+        l1 += L; l2 += L * L; c++;
+      }
+    s.Sharp = c > 0 ? Math.Sqrt(Math.Max(0, l2 / c - (l1 / c) * (l1 / c))) : 0;
+    // noise: mean |laplacian| in the flattest 20% of 16x16 blocks
+    var blocks = new List<double>();
+    for (int by = 1; by + 16 < H; by += 16)
+      for (int bx = 1; bx + 16 < W; bx += 16) {
+        double a = 0;
+        for (int y = by; y < by + 16; y++)
+          for (int x = bx; x < bx + 16; x++) { int i = y * W + x; a += Math.Abs(4 * gy[i] - gy[i - 1] - gy[i + 1] - gy[i - W] - gy[i + W]); }
+        blocks.Add(a / 256.0);
+      }
+    blocks.Sort();
+    int k = Math.Max(1, blocks.Count / 5); double ns = 0;
+    for (int i = 0; i < k && i < blocks.Count; i++) ns += blocks[i];
+    s.Noise = blocks.Count > 0 ? ns / k : 0;
+  }
+
+  // profile score over a set of shots (each metric normalized min-max inside the set)
+  public static readonly string[] Profiles = { "daylight", "night", "indoor", "fast" };
+  public static double[] Rank(List<XScores> list, string profile) {
+    int n = list.Count; var r = new double[n];
+    if (n == 0) return r;
+    Func<Func<XScores, double>, double[]> norm = f => {
+      double mn = double.MaxValue, mx = double.MinValue;
+      foreach (var x in list) { double v = f(x); mn = Math.Min(mn, v); mx = Math.Max(mx, v); }
+      var o = new double[n];
+      for (int i = 0; i < n; i++) o[i] = mx - mn < 1e-9 ? 0.5 : (f(list[i]) - mn) / (mx - mn);
+      return o;
+    };
+    double[] sh = norm(x => x.Sharp), no = norm(x => x.Noise / Math.Max(x.Mean, 0.05)), cl = norm(x => x.Clip), ca = norm(x => x.Cast), fp = norm(x => x.Fps);
+    for (int i = 0; i < n; i++) {
+      double ex = Math.Max(0, 1 - Math.Abs(list[i].Mean - 0.45) / 0.45);
+      switch (profile) {
+        case "daylight": r[i] = .35 * sh[i] + .25 * ex + .15 * (1 - ca[i]) + .15 * (1 - no[i]) + .10 * (1 - cl[i]); break;
+        case "night":    r[i] = .35 * ex + .30 * (1 - no[i]) + .20 * sh[i] + .15 * (1 - cl[i]); break;
+        case "indoor":   r[i] = .30 * ex + .25 * (1 - ca[i]) + .25 * sh[i] + .20 * (1 - no[i]); break;
+        default:         r[i] = .50 * fp[i] + .20 * sh[i] + .20 * ex + .10 * (1 - no[i]); break;
+      }
+      r[i] *= 0.4 + 0.6 * Math.Min(1, ex / 0.6);   // too dark / too bright is never "best"
+    }
+    return r;
+  }
+}
+
+public class XCrazy {
+  readonly XHub hub;
+  public string OutDir = "";
+  Thread th; volatile bool running;
+  public volatile string Phase = "idle", Current = "", Err = "", Light = "", RoundName = "", LastShot = "";
+  public int Round, ShotN, ShotTotal, RoundsDone;
+  public bool Quick;                 // tests: tiny plan, short waits
+  public int MaxRounds;              // 0 = nonstop
+  public DateTime ShotStarted = DateTime.Now; public double AvgShotSec = 3.2;
+  public string LastScoresJson = "null";
+  Dictionary<string, int> baseSet, cur = new Dictionary<string, int>();
+  List<int[]> sizes = new List<int[]>(); int maxSize;
+  readonly object fileLock = new object();
+  public static readonly string[] Keys = { "framesize", "quality", "xclk", "fps_limit", "brightness", "contrast", "saturation", "sharpness",
+    "denoise", "effect", "aec", "aec_value", "aec2", "ae_level", "agc", "agc_gain", "gainceiling", "awb", "awb_gain", "wb_mode",
+    "bpc", "wpc", "raw_gma", "lenc", "hmirror", "vflip", "dcw", "colorbar" };
+
+  public XCrazy(XHub h) { hub = h; }
+  public bool Running { get { return running; } }
+
+  // ---------- settings store ----------
+  static string StorePath { get { return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "XiaoCam\\studio.json"); } }
+  public void LoadDir(string def) {
+    OutDir = def;
+    try {
+      if (File.Exists(StorePath)) {
+        var d = Js().DeserializeObject(File.ReadAllText(StorePath)) as Dictionary<string, object>;
+        if (d != null && d.ContainsKey("crazyDir") && Convert.ToString(d["crazyDir"]).Length > 0) OutDir = Convert.ToString(d["crazyDir"]);
+      }
+    } catch { }
+  }
+  public string SetDir(string dir) {
+    if (running) throw new Exception("stop crazy mode first");
+    if (string.IsNullOrEmpty(dir) || !Path.IsPathRooted(dir)) throw new Exception("use a full folder path, like C:\\XiaoCam\\crazy");
+    dir = Path.GetFullPath(dir);
+    Directory.CreateDirectory(dir);
+    OutDir = dir;
+    try {
+      Directory.CreateDirectory(Path.GetDirectoryName(StorePath));
+      var d = new Dictionary<string, object>(); d["crazyDir"] = dir;
+      File.WriteAllText(StorePath, Js().Serialize(d));
+    } catch { }
+    return dir;
+  }
+  public static string PickFolder(string start) {
+    string res = null;
+    var t = new Thread(delegate() {
+      try {
+        using (var owner = new System.Windows.Forms.Form()) {
+          owner.TopMost = true; owner.ShowInTaskbar = false; owner.StartPosition = System.Windows.Forms.FormStartPosition.CenterScreen;
+          owner.Width = 1; owner.Height = 1; owner.Opacity = 0; owner.Show(); owner.Activate();
+          using (var d = new System.Windows.Forms.FolderBrowserDialog()) {
+            d.Description = "Choose where crazy mode saves the photos";
+            d.ShowNewFolderButton = true;
+            if (!string.IsNullOrEmpty(start) && Directory.Exists(start)) d.SelectedPath = start;
+            if (d.ShowDialog(owner) == System.Windows.Forms.DialogResult.OK) res = d.SelectedPath;
+          }
+        }
+      } catch { }
+    });
+    t.SetApartmentState(ApartmentState.STA); t.Start(); t.Join();
+    return res;
+  }
+  public static System.Web.Script.Serialization.JavaScriptSerializer Js() {
+    var j = new System.Web.Script.Serialization.JavaScriptSerializer(); j.MaxJsonLength = int.MaxValue; return j;
+  }
+
+  // ---------- plans ----------
+  static string Sg(int v) { return v > 0 ? "+" + v : v.ToString(); }
+  public static List<XShot> SweepPlan(int maxSize, List<int[]> sizes) {
+    var p = new List<XShot>();
+    int[] res = { 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 19 };
+    foreach (int r in res) if (r <= maxSize && r < sizes.Count) p.Add(new XShot("sweep", "resolution", sizes[r][0] + "x" + sizes[r][1]).S("framesize", r));
+    foreach (int q in new[] { 4, 6, 8, 10, 12, 15, 20, 30, 45, 63 }) p.Add(new XShot("sweep", "quality", "q" + q.ToString("00")).S("quality", q));
+    foreach (string k in new[] { "brightness", "contrast", "saturation", "sharpness" })
+      for (int v = -2; v <= 2; v++) p.Add(new XShot("sweep", k, Sg(v)).S(k, v));
+    foreach (int v in new[] { 0, 2, 4, 6, 8 }) p.Add(new XShot("sweep", "denoise", v.ToString()).S("denoise", v));
+    for (int v = -2; v <= 2; v++) p.Add(new XShot("sweep", "exposure-comp", "ev" + Sg(v)).S("aec", 1).S("ae_level", v));
+    foreach (int v in new[] { 25, 50, 100, 200, 400, 700, 1000, 1200 }) p.Add(new XShot("sweep", "manual-exposure", "exp" + v.ToString("0000")).S("aec", 0).S("aec_value", v));
+    for (int v = 0; v <= 1; v++) p.Add(new XShot("sweep", "exposure-dsp", v == 1 ? "on" : "off").S("aec", 1).S("aec2", v));
+    string[] gc = { "2x", "4x", "8x", "16x", "32x", "64x", "128x" };
+    for (int v = 0; v <= 6; v++) p.Add(new XShot("sweep", "gain-ceiling", (v + 1) + "-" + gc[v]).S("agc", 1).S("gainceiling", v));
+    foreach (int v in new[] { 0, 3, 6, 10, 15, 20, 30 }) p.Add(new XShot("sweep", "manual-gain", "gain" + (v + 1).ToString("00") + "x").S("agc", 0).S("agc_gain", v));
+    string[] wb = { "auto", "sunny", "cloudy", "office", "home" };
+    for (int v = 0; v <= 4; v++) p.Add(new XShot("sweep", "white-balance", v + "-" + wb[v]).S("awb", 1).S("awb_gain", 1).S("wb_mode", v));
+    p.Add(new XShot("sweep", "white-balance", "5-awb-off").S("awb", 0));
+    string[][] tg = { new[] { "lens-correction", "lenc" }, new[] { "gamma", "raw_gma" }, new[] { "black-pixel-fix", "bpc" }, new[] { "white-pixel-fix", "wpc" }, new[] { "downscale-dcw", "dcw" } };
+    foreach (var t in tg) for (int v = 0; v <= 1; v++) p.Add(new XShot("sweep", t[0], v == 1 ? "on" : "off").S(t[1], v));
+    foreach (int v in new[] { 10, 16, 20, 24 }) p.Add(new XShot("sweep", "clock", v + "MHz").S("xclk", v));
+    return p;
+  }
+  public static List<XShot> QuickPlan(int maxSize, List<int[]> sizes) {
+    var p = new List<XShot>();
+    p.Add(new XShot("sweep", "resolution", sizes[10][0] + "x" + sizes[10][1]).S("framesize", 10));
+    p.Add(new XShot("sweep", "resolution", sizes[13][0] + "x" + sizes[13][1]).S("framesize", 13));
+    p.Add(new XShot("sweep", "quality", "q06").S("quality", 6));
+    p.Add(new XShot("sweep", "quality", "q30").S("quality", 30));
+    p.Add(new XShot("sweep", "manual-exposure", "exp0050").S("aec", 0).S("aec_value", 50));
+    p.Add(new XShot("sweep", "manual-exposure", "exp1000").S("aec", 0).S("aec_value", 1000));
+    p.Add(new XShot("sweep", "brightness", "-2").S("brightness", -2));
+    p.Add(new XShot("sweep", "brightness", "+2").S("brightness", 2));
+    return p;
+  }
+  // winners of the sweep, mixed: per profile, top 4 groups by score spread x top 2 values
+  public static List<XShot> MixPlan(List<XShot> shots, List<XScores> scores, int groupsPer, int valuesPer) {
+    var outp = new List<XShot>(); var seen = new HashSet<string>();
+    foreach (string prof in XScore.Profiles) {
+      double[] r = XScore.Rank(scores, prof);
+      var byGroup = new Dictionary<string, List<int>>();
+      for (int i = 0; i < shots.Count; i++) {
+        if (!byGroup.ContainsKey(shots[i].Group)) byGroup[shots[i].Group] = new List<int>();
+        byGroup[shots[i].Group].Add(i);
+      }
+      var spread = new List<KeyValuePair<string, double>>();
+      foreach (var kv in byGroup) {
+        if (kv.Value.Count < 2) continue;
+        double mn = 1e9, mx = -1e9; foreach (int i in kv.Value) { mn = Math.Min(mn, r[i]); mx = Math.Max(mx, r[i]); }
+        spread.Add(new KeyValuePair<string, double>(kv.Key, mx - mn));
+      }
+      spread.Sort((a, b) => b.Value.CompareTo(a.Value));
+      var choices = new List<List<XShot>>();
+      for (int g = 0; g < Math.Min(groupsPer, spread.Count); g++) {
+        var idx = new List<int>(byGroup[spread[g].Key]);
+        idx.Sort((a, b) => r[b].CompareTo(r[a]));
+        var top = new List<XShot>();
+        for (int j = 0; j < Math.Min(valuesPer, idx.Count); j++) top.Add(shots[idx[j]]);
+        choices.Add(top);
+      }
+      int combos = 1; foreach (var c in choices) combos *= c.Count;
+      int nn = 0;
+      for (int m = 0; m < combos; m++) {
+        var s = new XShot("mix", "mix-" + prof, ""); s.Mix = prof; int rest = m;
+        foreach (var c in choices) {
+          XShot pick = c[rest % c.Count]; rest /= c.Count;
+          foreach (var kv in pick.Set) s.Set[kv.Key] = kv.Value;
+          s.From.Add(pick.Group + "=" + pick.Label);
+        }
+        var keys = new List<string>(s.Set.Keys); keys.Sort();
+        var sig = new StringBuilder(); foreach (string k in keys) sig.Append(k).Append('=').Append(s.Set[k]).Append(';');
+        if (!seen.Add(sig.ToString())) continue;
+        nn++; s.Label = prof + "_" + nn.ToString("00");
+        outp.Add(s);
+      }
+    }
+    return outp;
+  }
+
+  // ---------- run ----------
+  public void Start() {
+    if (running) return;
+    if (string.IsNullOrEmpty(OutDir)) throw new Exception("choose an output folder first");
+    if (ReadBoard() == null) throw new Exception("camera not connected (or old firmware - flash with option 1)");
+    if (!hub.IsLive) throw new Exception("no picture coming from the camera");
+    Directory.CreateDirectory(OutDir);
+    Err = ""; RoundsDone = 0; running = true; Phase = "starting";
+    th = new Thread(Loop); th.IsBackground = true; th.Start();
+  }
+  public void Stop() { running = false; }
+  public void StopAndWait(int ms) { running = false; Thread t = th; if (t != null) t.Join(ms); }
+
+  Dictionary<string, int> ReadBoard() {
+    string j = hub.BoardJson;
+    if (string.IsNullOrEmpty(j) || j.IndexOf("\"framesize\"", StringComparison.Ordinal) < 0) return null;
+    try {
+      var d = Js().DeserializeObject(j) as Dictionary<string, object>;
+      if (d == null) return null;
+      var o = new Dictionary<string, int>();
+      foreach (string k in Keys) if (d.ContainsKey(k)) o[k] = Convert.ToInt32(d[k]);
+      if (d.ContainsKey("max_size")) maxSize = Convert.ToInt32(d["max_size"]);
+      if (d.ContainsKey("sizes")) {
+        sizes = new List<int[]>();
+        foreach (object z in (object[])d["sizes"]) { var a = (object[])z; sizes.Add(new[] { Convert.ToInt32(a[0]), Convert.ToInt32(a[1]) }); }
+      }
+      return o;
+    } catch { return null; }
+  }
+
+  void Wait(int ms) {
+    var until = DateTime.Now.AddMilliseconds(ms);
+    while (DateTime.Now < until) { if (!running) throw new XStopEx(); Thread.Sleep(50); }
+  }
+
+  void Loop() {
+    try {
+      baseSet = ReadBoard();
+      cur = new Dictionary<string, int>(baseSet);
+      hub.Cmd("set autosave 0");      // do not wear the board's flash with thousands of changes
+      while (running) {
+        RunRound();
+        RoundsDone++;
+        if (MaxRounds > 0 && RoundsDone >= MaxRounds) break;
+      }
+    } catch (XStopEx) {
+    } catch (Exception e) { Err = e.Message; hub.OnMsg("crazy mode stopped: " + e.Message); }
+    finally {
+      Phase = "restoring your settings";
+      try { Apply(new Dictionary<string, int>(), false); } catch { }
+      running = false;
+      hub.Cmd("set autosave 1");
+      Phase = "idle"; Current = "";
+    }
+  }
+
+  // send only what differs from what the camera has now; base + overrides
+  bool Apply(Dictionary<string, int> over, bool forceAll) {
+    var full = new Dictionary<string, int>(baseSet);
+    foreach (var kv in over) full[kv.Key] = kv.Value;
+    bool resChange = false;
+    foreach (string k in Keys) {
+      if (!full.ContainsKey(k)) continue;
+      int v = full[k], c;
+      if (!forceAll && cur.TryGetValue(k, out c) && c == v) continue;
+      if (k == "framesize" || k == "xclk") resChange = true;
+      hub.Cmd("set " + k + " " + v);
+      cur[k] = v;
+    }
+    return resChange;
+  }
+
+  int[] Expect(Dictionary<string, int> over) {
+    int fs = over.ContainsKey("framesize") ? over["framesize"] : baseSet["framesize"];
+    return fs >= 0 && fs < sizes.Count ? sizes[fs] : null;
+  }
+
+  // one shot: apply, settle, measure fps, grab a matching frame
+  byte[] Take(Dictionary<string, int> over, out double fps) {
+    for (int attempt = 0; ; attempt++) {
+      while (!hub.IsLive) { Phase = "waiting for the camera (unplugged?)"; Wait(500); }
+      Phase = "shooting";
+      bool big = Apply(over, attempt > 0);
+      Wait(Quick ? 400 : (1200 + (big ? 1500 : 0)));
+      long f0 = hub.TotalFrames; var t0 = DateTime.Now;
+      Wait(Quick ? 500 : 1500);
+      fps = (hub.TotalFrames - f0) / (DateTime.Now - t0).TotalSeconds;
+      int[] want = Expect(over);
+      var deadline = DateTime.Now.AddSeconds(5);
+      byte[] last = null;
+      while (DateTime.Now < deadline) {
+        DateTime at; int w, h;
+        byte[] f = hub.LatestWithTime(out at, out w, out h);
+        if (f != null && at > t0) {
+          last = f;
+          if (want == null || (w == want[0] && h == want[1])) return f;
+        }
+        Wait(60);
+      }
+      if (last != null) return last;          // camera ignored the size: keep what it sent
+      if (attempt >= 2) throw new Exception("no pictures from the camera");
+      cur.Clear();                           // after a reconnect, send everything again
+    }
+  }
+
+  void RunRound() {
+    ReadBoard();
+    Round++; ShotN = 0;
+    // 1. light probe
+    Phase = "measuring the light"; Current = "light probe";
+    var probe = new Dictionary<string, int>(); probe["aec"] = 0; probe["aec_value"] = 300; probe["agc"] = 0; probe["agc_gain"] = 0;
+    double pf; byte[] pj = Take(probe, out pf);
+    byte[] pth; XScores ps = XScore.Compute(pj, out pth);
+    Light = ps.Mean > 0.35 ? "day" : ps.Mean > 0.10 ? "dim" : "night";
+    int num = NextRoundNumber();
+    RoundName = DateTime.Now.ToString("yyyy-MM-dd_HHmm") + "_R" + num.ToString("000") + "_" + Light;
+    string rdir = Path.Combine(OutDir, RoundName);
+    Directory.CreateDirectory(rdir);
+    var round = new Dictionary<string, object>();
+    round["round"] = num; round["name"] = RoundName; round["light"] = Light; round["lightMean"] = Math.Round(ps.Mean, 4);
+    round["started"] = DateTime.Now.ToString("s"); round["base"] = baseSet; round["sizes"] = sizes; round["maxSize"] = maxSize;
+    var shotList = new List<object>(); round["shots"] = shotList;
+    File.WriteAllBytes(Path.Combine(rdir, "0-light-probe.jpg"), pj);
+
+    List<XShot> plan = Quick ? QuickPlan(maxSize, sizes) : SweepPlan(maxSize, sizes);
+    ShotTotal = plan.Count + (Quick ? 4 : 40);
+    var done = new List<XShot>(); var sc = new List<XScores>();
+    foreach (XShot s in plan) { XScores r = Shoot(s, rdir, round, shotList); if (r != null) { done.Add(s); sc.Add(r); } }
+    List<XShot> mix = MixPlan(done, sc, Quick ? 2 : 4, 2);
+    ShotTotal = ShotN + mix.Count;
+    foreach (XShot s in mix) Shoot(s, rdir, round, shotList);
+    round["finished"] = DateTime.Now.ToString("s");
+    WriteRound(rdir, round);
+  }
+
+  int NextRoundNumber() {
+    int mx = 0;
+    foreach (string d in Directory.GetDirectories(OutDir)) {
+      var m = Regex.Match(Path.GetFileName(d), "_R(\\d{3,})_");
+      if (m.Success) mx = Math.Max(mx, int.Parse(m.Groups[1].Value));
+    }
+    return mx + 1;
+  }
+
+  static string Safe(string s) { return Regex.Replace(s, "[^A-Za-z0-9_+\\-.]", "_"); }
+
+  XScores Shoot(XShot s, string rdir, Dictionary<string, object> round, List<object> shotList) {
+    ShotN++; Current = s.Group + " = " + s.Label; ShotStarted = DateTime.Now;
+    double fps; byte[] jpg = Take(s.Set, out fps);
+    byte[] thumb; XScores r = XScore.Compute(jpg, out thumb); r.Fps = fps;
+    string sub = s.Phase == "mix" ? "2-mix" : "1-sweep\\" + Safe(s.Group);
+    string dir = Path.Combine(rdir, sub), tdir = Path.Combine(dir, "thumbs");
+    Directory.CreateDirectory(tdir);
+    string name = Safe(s.Label) + ".jpg";
+    File.WriteAllBytes(Path.Combine(dir, name), jpg);
+    File.WriteAllBytes(Path.Combine(tdir, name), thumb);
+    // what the camera really took
+    var now = ReadBoard() ?? new Dictionary<string, int>();
+    var full = new Dictionary<string, int>(baseSet); foreach (var kv in s.Set) full[kv.Key] = kv.Value;
+    var notApplied = new List<string>();
+    foreach (var kv in s.Set) { int v; if (now.TryGetValue(kv.Key, out v) && v != kv.Value) notApplied.Add(kv.Key); }
+    string rel = RoundName + "/" + sub.Replace('\\', '/') + "/" + name;
+    var d = new Dictionary<string, object>();
+    d["file"] = rel; d["thumb"] = RoundName + "/" + sub.Replace('\\', '/') + "/thumbs/" + name;
+    d["phase"] = s.Phase; d["group"] = s.Group; d["label"] = s.Label; d["changed"] = s.Set; d["set"] = full;
+    if (s.Mix != null) { d["mix"] = s.Mix; d["from"] = s.From; }
+    d["notApplied"] = notApplied; d["scores"] = r.ToDict(); d["time"] = DateTime.Now.ToString("s");
+    shotList.Add(d);
+    WriteRound(rdir, round);
+    LastShot = rel; LastScoresJson = Js().Serialize(r.ToDict());
+    double took = (DateTime.Now - ShotStarted).TotalSeconds;
+    AvgShotSec = AvgShotSec * 0.8 + took * 0.2;
+    return r;
+  }
+
+  void WriteRound(string rdir, Dictionary<string, object> round) {
+    lock (fileLock) {
+      string p = Path.Combine(rdir, "round.json"), tmp = p + ".tmp";
+      File.WriteAllText(tmp, Js().Serialize(round));
+      if (File.Exists(p)) File.Delete(p);
+      File.Move(tmp, p);
+    }
+  }
+
+  // ---------- library for Compare ----------
+  public string RoundsJson() {
+    var list = new List<object>();
+    if (Directory.Exists(OutDir)) {
+      var dirs = Directory.GetDirectories(OutDir); Array.Sort(dirs);
+      foreach (string d in dirs) {
+        if (File.Exists(Path.Combine(d, "round.json"))) list.Add(Path.GetFileName(d));
+      }
+    }
+    var o = new Dictionary<string, object>(); o["ok"] = true; o["dir"] = OutDir; o["rounds"] = list;
+    return Js().Serialize(o);
+  }
+  public string RoundJson(string id) {
+    if (!Regex.IsMatch(id ?? "", "^[A-Za-z0-9_\\-]+$")) return null;
+    string p = Path.Combine(OutDir, id, "round.json");
+    lock (fileLock) { return File.Exists(p) ? File.ReadAllText(p) : null; }
+  }
+  // only files inside the output folder
+  public string SafeFile(string rel) {
+    if (string.IsNullOrEmpty(rel) || string.IsNullOrEmpty(OutDir)) return null;
+    string root = Path.GetFullPath(OutDir).TrimEnd('\\') + "\\";
+    string full;
+    try { full = Path.GetFullPath(Path.Combine(root, rel.Replace('/', '\\'))); } catch { return null; }
+    if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return null;
+    if (!full.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase)) return null;
+    return File.Exists(full) ? full : null;
+  }
+  string StarsPath { get { return Path.Combine(OutDir, "stars.json"); } }
+  public List<string> Stars() {
+    try { if (File.Exists(StarsPath)) { var a = Js().DeserializeObject(File.ReadAllText(StarsPath)) as object[]; var l = new List<string>(); if (a != null) foreach (object x in a) l.Add(Convert.ToString(x)); return l; } } catch { }
+    return new List<string>();
+  }
+  public void Star(string rel, bool on) {
+    lock (fileLock) {
+      var s = Stars(); s.Remove(rel); if (on) s.Add(rel);
+      File.WriteAllText(StarsPath, Js().Serialize(s));
+    }
+  }
+
+  public string StateJson() {
+    var o = new Dictionary<string, object>();
+    o["running"] = running; o["phase"] = Phase; o["current"] = Current; o["err"] = Err; o["dir"] = OutDir;
+    o["round"] = RoundName; o["light"] = Light; o["shot"] = ShotN; o["total"] = ShotTotal; o["roundsDone"] = RoundsDone;
+    o["eta"] = running ? Math.Round(Math.Max(0, ShotTotal - ShotN) * AvgShotSec) : 0;
+    o["last"] = LastShot;
+    return Js().Serialize(o).TrimEnd('}') + ",\"scores\":" + LastScoresJson + "}";
   }
 }
 '@
@@ -1302,8 +1873,8 @@ main{display:grid;grid-template-columns:1fr 372px;min-height:0}
 .big{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
 #hist{width:100%;height:44px;display:block}
 aside{background:var(--p);border-left:1px solid var(--ln);display:grid;grid-template-rows:auto 1fr;min-height:0}
-#tabs{display:grid;grid-template-columns:repeat(6,1fr);border-bottom:1px solid var(--ln)}
-#tabs button{border:0;border-radius:0;background:transparent;padding:11px 2px;color:var(--mu);border-bottom:2px solid transparent;font-size:12.5px}
+#tabs{display:grid;grid-template-columns:repeat(7,1fr);border-bottom:1px solid var(--ln)}
+#tabs button{border:0;border-radius:0;background:transparent;padding:11px 2px;color:var(--mu);border-bottom:2px solid transparent;font-size:12px}
 #tabs button.on{color:var(--tx);border-bottom-color:var(--ac)}
 #panes{overflow:auto;padding:4px 14px 24px;scrollbar-width:thin;scrollbar-color:#2a2f37 transparent}
 .pane{display:none}.pane.on{display:block}
@@ -1387,6 +1958,229 @@ kbd{background:#222730;border:1px solid #333a45;border-bottom-width:2px;border-r
 </main>
 </div>
 <div id="toast"></div>
+<style>
+#modeSw{margin-left:4px}#modeSw button{padding:5px 14px}
+body.crazyOn #p_image,body.crazyOn #p_light,body.crazyOn #p_color{pointer-events:none;opacity:.4}
+.lockmsg{display:none;margin:10px 0 0;padding:7px 10px;border-radius:6px;background:#2a210c;border:1px solid #5c4613;color:#fde3a7;font-size:12px}
+body.crazyOn .lockmsg{display:block}
+#cmp{display:none;grid-row:1/3;min-height:0;flex-direction:column;position:relative}
+body.cmpMode #stage,body.cmpMode #bottom{display:none}body.cmpMode #cmp{display:flex}
+#cmpBar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;padding:9px 10px;border-bottom:1px solid var(--ln);background:var(--p)}
+#cmpBar select{width:auto;max-width:230px}#cmpBar label{color:var(--mu);display:flex;align-items:center;gap:5px}
+#cmpBar .seg button{padding:5px 10px;white-space:nowrap}
+#cmpEmpty{display:none;flex:1;align-items:center;justify-content:center;flex-direction:column;gap:6px;color:var(--mu);text-align:center;padding:30px}
+#cmpEmpty b{color:var(--tx);font-size:15px}
+#best{display:flex;gap:8px;padding:10px;overflow-x:auto;border-bottom:1px solid var(--ln);flex:none;scrollbar-width:thin}
+.bestc{flex:none;width:168px;background:var(--bg);border:1px solid var(--ln);border-radius:8px;overflow:hidden;cursor:pointer}
+.bestc:hover{border-color:#3a4250}
+.bestc img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#000}
+.bestc div{padding:5px 8px;font-size:12px;line-height:1.35}.bestc div b{color:#bfd6ff}
+#gridw{flex:1;overflow:auto;padding:10px;scrollbar-width:thin;scrollbar-color:#2a2f37 transparent}
+#cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:8px}
+.cc{position:relative;background:var(--bg);border:1px solid var(--ln);border-radius:8px;overflow:hidden;cursor:pointer}
+.cc:hover{border-color:#3a4250}.cc.sel{outline:2px solid var(--ac);outline-offset:-1px}
+.cc img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#000}
+.cc .ci{padding:5px 8px 7px;font-size:12px}.cc .ci b{display:block;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cc .ci span{color:var(--mu)}
+.cc .num{position:absolute;left:6px;top:6px;background:var(--ac);color:#fff;border-radius:50%;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:12px}
+.star{position:absolute;right:4px;top:2px;font-size:19px;line-height:1;color:#ffd54a;text-shadow:0 1px 3px #000;cursor:pointer;background:none;border:0;padding:2px 4px}
+.star.off{color:rgba(255,255,255,.55)}
+.sbar{height:4px;background:#20242b;border-radius:2px;margin-top:4px}.sbar i{display:block;height:100%;background:var(--ac);border-radius:2px}
+#tray{display:flex;align-items:center;gap:8px;padding:8px 10px;border-top:1px solid var(--ln);background:var(--p);flex:none}
+#tray img{height:38px;border-radius:4px}#tray .sp{flex:1}
+#cview{position:absolute;inset:0;background:var(--bg);display:none;flex-direction:column;z-index:6}
+#cvBar{display:flex;gap:8px;align-items:center;padding:8px 10px;border-bottom:1px solid var(--ln);background:var(--p)}
+#cvBar button.on{border-color:var(--ac);color:#bfd6ff}
+#cpanes{flex:1;display:grid;gap:6px;padding:6px;min-height:0}
+.cvp{position:relative;overflow:hidden;background:#000;cursor:grab;min-height:0}
+.cvp img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;transform-origin:50% 50%;user-select:none;-webkit-user-drag:none}
+.cvp .tag{position:absolute;left:8px;top:8px;background:rgba(20,23,28,.85);padding:2px 8px;border-radius:5px;font-size:12px;z-index:3}
+.cvp .tag.r{left:auto;right:8px}
+#cinfos{display:grid;gap:6px;padding:0 6px 6px;flex:none;max-height:40vh;overflow:auto}
+.cinfo{background:var(--p);border:1px solid var(--ln);border-radius:8px;padding:8px 10px;font-size:12px;min-width:0}
+.cinfo h5{margin:0 0 5px;font-size:13px;display:flex;align-items:center;gap:8px}
+.cinfo h5 .n{background:var(--ac);color:#fff;border-radius:50%;width:20px;height:20px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;flex:none}
+.cinfo table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}.cinfo td{padding:1px 4px;border-bottom:1px solid #1d2127}
+.cinfo td:last-child{text-align:right}.cinfo tr.d td{color:#ffd54a}.cinfo tr.best td:last-child{color:#4ade80;font-weight:600}
+.cinfo .cols{display:grid;grid-template-columns:1fr 1fr;gap:10px;align-items:start}
+.cinfo .btns{margin-top:6px}.cinfo .btns button{padding:4px 9px;font-size:12px}
+.cinfo input{width:130px;padding:3px 6px}
+.wline{position:absolute;top:0;bottom:0;width:2px;background:#fff;z-index:4;cursor:ew-resize;box-shadow:0 0 0 1px rgba(0,0,0,.4)}
+.wline::after{content:"";position:absolute;top:50%;left:-9px;width:20px;height:20px;margin-top:-10px;border-radius:50%;background:#fff;box-shadow:0 1px 4px rgba(0,0,0,.5)}
+</style>
+<script>
+'use strict';
+// ===================== Crazy mode + Compare =====================
+let CZ=null;
+const CX={shots:[],stars:new Set(),sel:[],prof:'daylight',limit:300,z:{z:1,x:0,y:0},wipe:false,wx:50,all:false};
+const PROF={daylight:'Daylight',night:'Night',indoor:'Indoor',fast:'Fast video'};
+const czEnc=p=>'/crazy/file?p='+encodeURIComponent(p);
+const czEsc=s=>String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const czName=s=>s.mix?'Mix for '+PROF[s.mix]+' #'+parseInt(s.label.split('_').pop(),10):s.group+': '+s.label;
+const czTime=s=>{s=s|0;const m=s/60|0;return m?m+' min '+(s%60)+' s':s+' s'};
+
+function crazyPane(p){
+  p.innerHTML=`<div class="sec">Crazy mode</div>
+  <div class="hint">Shoots the same scene with every setting, nonstop, and saves scored photos in neat folders. Tape the camera down so it always sees the same thing. Your own settings come back when you stop.</div>
+  <div class="field" style="margin-top:10px"><label>Output folder</label><div style="display:flex;gap:6px"><input type="text" id="czDir" spellcheck="false"><button id="czPick">Choose...</button></div></div>
+  <div class="btns" style="margin-top:0"><button id="czSet">Use typed path</button><button id="czOpen">Open folder</button></div>
+  <button id="czGo" class="pri" style="width:100%;padding:11px;font-size:14px;font-weight:600;margin-top:12px">Start crazy mode</button>
+  <div class="meter" style="margin-top:10px"><i id="czBar" style="background:var(--ac)"></i></div>
+  <div class="kv" id="czInfo" style="margin-top:8px"></div>
+  <div class="sec">Last shot</div>
+  <img id="czLast" alt="" style="width:100%;border-radius:6px;display:none;background:#000">
+  <div class="kv" id="czScores" style="margin-top:6px"></div>
+  <button id="czCmp" style="width:100%;margin-top:12px">Open Compare</button>
+  <div class="sec">One round</div>
+  <div class="hint">1. Light probe (day / dim / night). 2. Sweep: every value of every setting, one at a time (~95 photos). 3. Mix: for each need (daylight, night, indoor, fast video) the 4 settings that mattered most, best 2 values each, all combinations. About 8-10 min per round, then the next round starts.</div>`;
+  const dir=p.querySelector('#czDir');dir.addEventListener('input',()=>dir.dataset.dirty=1);
+  p.querySelector('#czPick').onclick=async()=>{toast('A folder window opened - it may be behind the browser');const r=await api('/api/crazy/folder?pick=1');if(r.ok){delete dir.dataset.dirty;dir.value=r.dir;toast('Folder: '+r.dir)}else if(r.err!=='cancelled')toast(r.err||'Could not set the folder')};
+  p.querySelector('#czSet').onclick=async()=>{const r=await api('/api/crazy/folder?path='+encodeURIComponent(dir.value));if(r.ok){delete dir.dataset.dirty;dir.value=r.dir;toast('Folder: '+r.dir)}else toast(r.err||'Bad folder')};
+  p.querySelector('#czOpen').onclick=()=>api('/api/crazy/open');
+  p.querySelector('#czGo').onclick=async()=>{if(CZ&&CZ.running){await api('/api/crazy/stop');toast('Stopping - putting your settings back...');return}
+    const r=await api('/api/crazy/start');toast(r.ok?'Crazy mode started':'Could not start: '+(r.err||''))};
+  p.querySelector('#czCmp').onclick=()=>setMode('cmp');
+  ['p_image','p_light','p_color'].forEach(id=>{const pane=document.getElementById(id);if(pane){const m=el('div','lockmsg','Crazy mode is running - settings are locked. Stop it in the Crazy tab.');pane.prepend(m)}});
+}
+
+function updCrazy(c){CZ=c;if(!c)return;
+  document.body.classList.toggle('crazyOn',!!c.running);
+  const g=$('#czGo');if(!g)return;
+  g.textContent=c.running?'Stop crazy mode':'Start crazy mode';g.classList.toggle('pri',!c.running);g.classList.toggle('danger',!!c.running);
+  const d=$('#czDir');if(d&&!d.dataset.dirty&&document.activeElement!==d)d.value=c.dir||'';
+  $('#czBar').style.width=c.running&&c.total?Math.min(100,c.shot/c.total*100)+'%':'0';
+  const rows=c.running?[['State',c.phase],['Round',c.round||'-'],['Light',c.light||'-'],['Shot',c.shot+' of '+c.total],['Testing now',c.current||'-'],['Round ends in','~'+czTime(c.eta)],['Rounds done',c.roundsDone]]
+    :[['State',c.phase==='idle'?'stopped':c.phase],['Rounds done this run',c.roundsDone]];
+  if(c.err)rows.push(['Last error',c.err]);
+  $('#czInfo').innerHTML=rows.map(([a,b])=>`<span>${a}</span><b title="${czEsc(b)}">${czEsc(b)}</b>`).join('');
+  const li=$('#czLast');if(c.last&&li.dataset.p!==c.last){li.dataset.p=c.last;li.src=czEnc(c.last);li.style.display='block'}
+  const s=c.scores;$('#czScores').innerHTML=s?[['Size',s.w+' x '+s.h],['Sharpness',s.sharp],['Noise',s.noise],['Brightness',Math.round(s.mean*100)+'%'],['Clipped',(s.clip*100).toFixed(1)+'%'],['FPS',s.fps],['File',s.kb+' KB']].map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join(''):'';
+  if(c.running){$('#stat').textContent='CRAZY MODE - shot '+c.shot+' of '+c.total+' - '+(c.current||c.phase)}
+}
+
+// ---------- compare: data ----------
+function setMode(m){document.body.classList.toggle('cmpMode',m==='cmp');document.querySelectorAll('#modeSw button').forEach(b=>b.classList.toggle('on',b.dataset.m===m));
+  if(m==='cmp')loadLib();else{closeView();layout()}}
+async function loadLib(){
+  const r=await api('/api/crazy/rounds');const shots=[];
+  if(r.ok)for(const id of r.rounds){const j=await api('/api/crazy/round?id='+encodeURIComponent(id));if(!j||!j.shots)continue;
+    j.shots.forEach(s=>{s.round=id;s.light=j.light;s.rnum=j.round;shots.push(s)})}
+  const st=await api('/api/crazy/stars');CX.stars=new Set(Array.isArray(st)?st:[]);
+  CX.shots=shots;CX.rounds=r.ok?r.rounds:[];CX.dir=r.dir||'';
+  const keep=new Set(CX.sel.map(s=>s.file));CX.sel=shots.filter(s=>keep.has(s.file));
+  fillFilters();cmpRender()}
+function fillFilters(){
+  const opt=(sel,list,all)=>{const s=$(sel),v=s.value;s.innerHTML=`<option value="">${all}</option>`+list.map(x=>`<option value="${czEsc(x[0])}">${czEsc(x[1])}</option>`).join('');if([...s.options].some(o=>o.value===v))s.value=v};
+  opt('#fRound',CX.rounds.slice().reverse().map(r=>[r,r.replace(/_/g,' ')]),'All rounds');
+  opt('#fLight',['day','dim','night'].filter(l=>CX.shots.some(s=>s.light===l)).map(l=>[l,l]),'All light');
+  const gs=[...new Set(CX.shots.map(s=>s.group))].sort();opt('#fGroup',gs.map(g=>[g,g]),'All settings');
+}
+function filtered(){const r=$('#fRound').value,l=$('#fLight').value,g=$('#fGroup').value,st=$('#fStar').checked;
+  return CX.shots.filter(s=>(!r||s.round===r)&&(!l||s.light===l)&&(!g||s.group===g)&&(!st||CX.stars.has(s.file)))}
+// same formula as the PC engine (XScore.Rank); noise is judged relative to brightness
+function rank(list,prof){const n=list.length,o=new Map();if(!n)return o;
+  const nm=f=>{let mn=Infinity,mx=-Infinity;list.forEach(s=>{const v=f(s.scores);mn=Math.min(mn,v);mx=Math.max(mx,v)});return list.map(s=>mx-mn<1e-9?.5:(f(s.scores)-mn)/(mx-mn))};
+  const sh=nm(x=>x.sharp),no=nm(x=>x.noise/Math.max(x.mean,.05)),cl=nm(x=>x.clip),ca=nm(x=>x.cast),fp=nm(x=>x.fps);
+  list.forEach((s,i)=>{const ex=Math.max(0,1-Math.abs(s.scores.mean-.45)/.45);let v;
+    if(prof==='daylight')v=.35*sh[i]+.25*ex+.15*(1-ca[i])+.15*(1-no[i])+.10*(1-cl[i]);
+    else if(prof==='night')v=.35*ex+.30*(1-no[i])+.20*sh[i]+.15*(1-cl[i]);
+    else if(prof==='indoor')v=.30*ex+.25*(1-ca[i])+.25*sh[i]+.20*(1-no[i]);
+    else v=.50*fp[i]+.20*sh[i]+.20*ex+.10*(1-no[i]);v*=.4+.6*Math.min(1,ex/.6);o.set(s,v)});return o}
+
+// ---------- compare: grid ----------
+function cmpRender(){
+  const list=filtered();const has=CX.shots.length>0;
+  $('#cmpEmpty').style.display=has?'none':'flex';$('#best').style.display=has?'flex':'none';$('#gridw').style.display=has?'block':'none';
+  $('#cmpCount').textContent=has?list.length+' of '+CX.shots.length+' photos':'';
+  const sc=rank(list,CX.prof),srt=$('#fSort').value;
+  const key={score:s=>-sc.get(s),sharp:s=>-s.scores.sharp,noise:s=>s.scores.noise,bright:s=>-s.scores.mean,fps:s=>-s.scores.fps,kb:s=>s.scores.kb,time:s=>-(Date.parse(s.time)||0)}[srt];
+  const sorted=list.slice().sort((a,b)=>key(a)-key(b));
+  // best per need, per light level
+  const best=$('#best');best.innerHTML='';
+  const lights=['day','dim','night'].filter(l=>list.some(s=>s.light===l));
+  Object.keys(PROF).forEach(p=>lights.forEach(l=>{const sub=list.filter(s=>s.light===l);const r=rank(sub,p);let b=null,bv=-1;sub.forEach(s=>{if(r.get(s)>bv){bv=r.get(s);b=s}});if(!b)return;
+    const c=el('div','bestc',`<img loading="lazy" src="${czEnc(b.thumb)}" alt=""><div><b>${PROF[p]}</b> &middot; ${l}<br>${czEsc(czName(b))}</div>`);c.title='Best for '+PROF[p]+' in '+l+' light - click to select';c.onclick=()=>toggleSel(b);best.appendChild(c)}));
+  const g=$('#cgrid');g.innerHTML='';
+  sorted.slice(0,CX.limit).forEach(s=>{const v=sc.get(s)||0;const i=CX.sel.indexOf(s);
+    const c=el('div','cc'+(i>=0?' sel':''),`<img loading="lazy" src="${czEnc(s.thumb)}" alt="">${i>=0?`<span class="num">${i+1}</span>`:''}
+      <button class="star${CX.stars.has(s.file)?'':' off'}" title="Star">${CX.stars.has(s.file)?'&#9733;':'&#9734;'}</button>
+      <div class="ci"><b>${czEsc(czName(s))}</b><span>R${s.rnum} &middot; ${s.light} &middot; ${s.scores.w}x${s.scores.h} &middot; ${s.scores.fps} fps</span><div class="sbar"><i style="width:${(v*100).toFixed(0)}%"></i></div></div>`);
+    c.onclick=()=>toggleSel(s);c.querySelector('.star').onclick=e=>{e.stopPropagation();starToggle(s)};g.appendChild(c)});
+  $('#more').style.display=sorted.length>CX.limit?'inline-block':'none';
+  drawTray()}
+function toggleSel(s){const i=CX.sel.indexOf(s);if(i>=0)CX.sel.splice(i,1);else{if(CX.sel.length>=4)CX.sel.shift();CX.sel.push(s)}cmpRender()}
+async function starToggle(s){const on=!CX.stars.has(s.file);const r=await api('/api/crazy/star?p='+encodeURIComponent(s.file)+'&on='+(on?1:0));
+  if(!r.ok){toast('Could not save the star');return}if(on)CX.stars.add(s.file);else CX.stars.delete(s.file);cmpRender();if($('#cview').style.display==='flex')openView()}
+function drawTray(){const t=$('#trayImgs');t.innerHTML=CX.sel.map(s=>`<img src="${czEnc(s.thumb)}" alt="" title="${czEsc(czName(s))}">`).join('');
+  $('#trayTxt').textContent=CX.sel.length?CX.sel.length+' selected':'Click photos to pick 2-4 to compare';
+  $('#goCmp').disabled=CX.sel.length<2;$('#goCmp').textContent='Compare ('+CX.sel.length+')'}
+
+// ---------- compare: side by side ----------
+const SKEYS=()=>SENSOR_KEYS;
+const SNAME={framesize:'Resolution',quality:'JPEG quality',fps_limit:'FPS limit',brightness:'Brightness',contrast:'Contrast',saturation:'Saturation',sharpness:'Sharpness',denoise:'Denoise',effect:'Effect',awb:'Auto WB',awb_gain:'WB gain',wb_mode:'WB mode',aec:'Auto exposure',aec2:'Exposure DSP',ae_level:'Exposure comp',aec_value:'Manual exposure',agc:'Auto gain',agc_gain:'Manual gain',gainceiling:'Max gain',bpc:'Black pixel fix',wpc:'White pixel fix',raw_gma:'Gamma',lenc:'Lens correction',hmirror:'Mirror',vflip:'Flip',dcw:'Downscale',xclk:'Clock MHz'};
+function sval(s,k){const v=s.set[k];if(v===undefined)return'-';if(k==='framesize')return s.scores.w+'x'+s.scores.h;if(k==='wb_mode')return['Auto','Sunny','Cloudy','Office','Home'][v]||v;if(k==='gainceiling')return(2<<v)+'x';if(k==='agc_gain')return(v+1)+'x';
+  if(['awb','awb_gain','aec','aec2','agc','bpc','wpc','raw_gma','lenc','hmirror','vflip','dcw'].includes(k))return v?'on':'off';return v}
+function openView(){const sel=CX.sel;if(sel.length<2){toast('Pick at least 2 photos');return}
+  const v=$('#cview');v.style.display='flex';const wipe=CX.wipe&&sel.length===2;
+  $('#cvWipe').style.display=sel.length===2?'':'none';$('#cvWipe').classList.toggle('on',wipe);$('#cvAll').classList.toggle('on',CX.all);
+  const panes=$('#cpanes');panes.innerHTML='';panes.style.gridTemplateColumns=wipe?'1fr':`repeat(${sel.length},1fr)`;
+  if(wipe){const p=el('div','cvp');p.innerHTML=`<img src="${czEnc(sel[0].file)}" alt=""><img class="wtop" src="${czEnc(sel[1].file)}" alt=""><span class="tag">1</span><span class="tag r">2</span><div class="wline"></div>`;panes.appendChild(p);wireView(p,true)}
+  else sel.forEach((s,i)=>{const p=el('div','cvp');p.innerHTML=`<img src="${czEnc(s.file)}" alt=""><span class="tag">${i+1}</span>`;panes.appendChild(p);wireView(p,false)});
+  zoomApply();
+  // info
+  const infos=$('#cinfos');infos.style.gridTemplateColumns=`repeat(${sel.length},1fr)`;infos.innerHTML='';
+  const diff=SKEYS().filter(k=>new Set(sel.map(s=>String(s.set[k]))).size>1);const keys=CX.all?SKEYS():diff;
+  const prof=Object.keys(PROF).map(p=>[p,rank(sel,p)]);
+  const met=[['Sharpness','sharp',1],['Noise','noise',-1],['Brightness','mean',0],['Clipped','clip',-1],['Color cast','cast',-1],['FPS','fps',1],['File KB','kb',-1]];
+  sel.forEach((s,i)=>{const c=el('div','cinfo');
+    const bestOf=(k,dir)=>{const vals=sel.map(x=>x.scores[k]);const b=dir>0?Math.max(...vals):Math.min(...vals);return s.scores[k]===b};
+    const mrows=met.map(([n,k,d])=>{const v=k==='mean'?Math.round(s.scores.mean*100)+'%':k==='clip'?(s.scores.clip*100).toFixed(1)+'%':s.scores[k];return`<tr class="${d&&bestOf(k,d)?'best':''}"><td>${n}</td><td>${v}</td></tr>`}).join('')
+      +prof.map(([p,r])=>{const mx=Math.max(...sel.map(x=>r.get(x)));const v=r.get(s);return`<tr class="${v===mx?'best':''}"><td>${PROF[p]} score</td><td>${Math.round(v*100)}</td></tr>`}).join('');
+    const srows=keys.length?keys.map(k=>`<tr class="${diff.includes(k)?'d':''}"><td>${SNAME[k]||k}</td><td>${czEsc(sval(s,k))}</td></tr>`).join(''):'<tr><td colspan="2">Same settings</td></tr>';
+    c.innerHTML=`<h5><span class="n">${i+1}</span>${czEsc(czName(s))}</h5><div class="hint" style="margin:0 0 6px">${czEsc(s.round)} &middot; ${s.light}${s.from?' &middot; mix of '+czEsc(s.from.join(', ')):''}</div>
+      <div class="cols"><table>${srows}</table><table>${mrows}</table></div>
+      <div class="btns"><button class="st">${CX.stars.has(s.file)?'&#9733; Starred':'&#9734; Star'}</button><button class="ap pri">Apply to camera</button><input type="text" placeholder="Profile name"><button class="sv">Save as profile</button></div>`;
+    c.querySelector('.st').onclick=()=>starToggle(s);
+    c.querySelector('.ap').onclick=()=>{if(CZ&&CZ.running){toast('Stop crazy mode first');return}applySet(s.set);toast('Applied to the camera: '+czName(s))};
+    c.querySelector('.sv').onclick=()=>{const n=c.querySelector('input').value.trim();if(!n){toast('Type a profile name');return}const P_=profs();const o={};SENSOR_KEYS.forEach(k=>{if(s.set[k]!==undefined)o[k]=s.set[k]});P_[n]=o;localStorage.xprof=JSON.stringify(P_);if($('#profList'))drawProfs();toast('Profile saved: '+n)};
+    infos.appendChild(c)})}
+function closeView(){const v=$('#cview');if(v)v.style.display='none'}
+function zoomApply(){const z=CX.z;document.querySelectorAll('#cpanes img').forEach(i=>i.style.transform=`translate(${z.x}px,${z.y}px) scale(${z.z})`);
+  document.querySelectorAll('#cpanes .wtop').forEach(i=>i.style.clipPath=`inset(0 0 0 ${CX.wx}%)`);document.querySelectorAll('#cpanes .wline').forEach(l=>l.style.left=CX.wx+'%')}
+function wireView(p,wipe){
+  p.addEventListener('wheel',e=>{e.preventDefault();const f=e.deltaY<0?1.2:1/1.2,z=CX.z,nz=Math.min(12,Math.max(1,z.z*f));const r=p.getBoundingClientRect();const cx=e.clientX-r.left-r.width/2,cy=e.clientY-r.top-r.height/2;
+    z.x=cx-(cx-z.x)*nz/z.z;z.y=cy-(cy-z.y)*nz/z.z;z.z=nz;if(nz===1){z.x=0;z.y=0}zoomApply()},{passive:false});
+  p.addEventListener('mousedown',e=>{e.preventDefault();CX.drag=wipe&&e.target.classList.contains('wline')?{p,wipe:true}:{p,x:e.clientX-CX.z.x,y:e.clientY-CX.z.y}});
+  p.addEventListener('dblclick',()=>{CX.z={z:1,x:0,y:0};zoomApply()})}
+
+function initCompare(){
+  const sw=el('div','seg');sw.id='modeSw';sw.innerHTML='<button data-m="live" class="on">Live</button><button data-m="cmp">Compare</button>';
+  document.querySelector('.brand').after(sw);sw.querySelectorAll('button').forEach(b=>b.onclick=()=>setMode(b.dataset.m));
+  const c=el('div');c.id='cmp';c.innerHTML=`<div id="cmpBar">
+    <div class="seg" id="fProf">${Object.entries(PROF).map(([k,v])=>`<button data-p="${k}"${k===CX.prof?' class="on"':''}>${v}</button>`).join('')}</div>
+    <select id="fRound"></select><select id="fLight"></select><select id="fGroup"></select>
+    <select id="fSort"><option value="score">Sort: best for the need</option><option value="sharp">Sort: sharpest</option><option value="noise">Sort: least noise</option><option value="bright">Sort: brightest</option><option value="fps">Sort: highest fps</option><option value="kb">Sort: smallest file</option><option value="time">Sort: newest</option></select>
+    <label><input type="checkbox" id="fStar"> Starred only</label><span class="sp"></span><span id="cmpCount" style="color:var(--mu)"></span><button id="cmpReload">Reload</button></div>
+    <div id="cmpEmpty"><b>No crazy-mode photos yet</b><span>Start crazy mode in the Crazy tab. Photos appear here as they are taken (press Reload).</span></div>
+    <div id="best"></div>
+    <div id="gridw"><div id="cgrid"></div><div style="text-align:center;margin:12px"><button id="more">Show more</button></div></div>
+    <div id="tray"><span id="trayImgs" style="display:flex;gap:6px"></span><span id="trayTxt" style="color:var(--mu)"></span><span class="sp"></span><button id="selClr">Clear</button><button id="goCmp" class="pri" disabled>Compare (0)</button></div>
+    <div id="cview"><div id="cvBar"><button id="cvBack">&larr; Back to all photos</button><button id="cvWipe" title="Drag the white line">A/B wipe</button><button id="cvAll">Show all settings</button><button id="cvFit">Reset zoom</button>
+      <span class="hint" style="margin:0 0 0 6px">Mouse wheel = zoom all together, drag = move. Yellow = settings that differ, green = best value.</span></div>
+      <div id="cpanes"></div><div id="cinfos"></div></div>`;
+  $('#left').appendChild(c);
+  c.querySelectorAll('#fProf button').forEach(b=>b.onclick=()=>{CX.prof=b.dataset.p;c.querySelectorAll('#fProf button').forEach(x=>x.classList.toggle('on',x===b));cmpRender()});
+  ['#fRound','#fLight','#fGroup','#fSort','#fStar'].forEach(s=>c.querySelector(s).onchange=()=>{CX.limit=300;cmpRender()});
+  c.querySelector('#cmpReload').onclick=loadLib;c.querySelector('#more').onclick=()=>{CX.limit+=300;cmpRender()};
+  c.querySelector('#selClr').onclick=()=>{CX.sel=[];cmpRender()};c.querySelector('#goCmp').onclick=()=>{CX.z={z:1,x:0,y:0};openView()};
+  c.querySelector('#cvBack').onclick=closeView;c.querySelector('#cvWipe').onclick=()=>{CX.wipe=!CX.wipe;openView()};
+  c.querySelector('#cvAll').onclick=()=>{CX.all=!CX.all;openView()};c.querySelector('#cvFit').onclick=()=>{CX.z={z:1,x:0,y:0};zoomApply()};
+  addEventListener('keydown',e=>{if(e.key==='Escape')closeView()});
+  addEventListener('mousemove',e=>{const d=CX.drag;if(!d)return;if(d.wipe){const r=d.p.getBoundingClientRect();CX.wx=Math.max(0,Math.min(100,(e.clientX-r.left)/r.width*100))}else{CX.z.x=e.clientX-d.x;CX.z.y=e.clientY-d.y}zoomApply()});
+  addEventListener('mouseup',()=>{CX.drag=null});
+  setInterval(()=>{if(document.body.classList.contains('cmpMode')&&CZ&&CZ.running&&$('#cview').style.display!=='flex'&&!document.hidden)loadLib()},20000);
+}
+</script>
 <script>
 'use strict';
 const $=s=>document.querySelector(s);
@@ -1460,7 +2254,7 @@ const COLOR=[
  {sec:'Test'},
  {k:'colorbar',t:'tog',l:'Color bars test pattern'},
 ];
-const TABS=[['image','Image',IMAGE],['light','Exposure',LIGHT],['color','Color',COLOR],['rec','Record',recPane],['wifi','WiFi',wifiPane],['board','Board',boardPane]];
+const TABS=[['image','Image',IMAGE],['light','Light',LIGHT],['color','Color',COLOR],['crazy','Crazy',crazyPane],['rec','Record',recPane],['wifi','WiFi',wifiPane],['board','Board',boardPane]];
 // ---------- presets + profiles ----------
 const SENSOR_KEYS=['framesize','quality','fps_limit','brightness','contrast','saturation','sharpness','denoise','effect','awb','awb_gain','wb_mode','aec','aec2','ae_level','aec_value','agc','agc_gain','gainceiling','bpc','wpc','raw_gma','lenc','hmirror','vflip','dcw','xclk'];
 async function applySet(o){for(const k of SENSOR_KEYS)if(k in o){pend[k]={v:+o[k],t:Date.now()};await api('/api/set?k='+k+'&v='+o[k])}refresh()}
@@ -1598,7 +2392,7 @@ function tool(t){const b=document.querySelector(`#tools [data-t="${t}"]`);
   localStorage.xview=JSON.stringify({rot:V.rot,mir:V.mir,grid:V.grid,cross:V.cross});layout()}
 document.querySelectorAll('#tools button').forEach(b=>b.onclick=()=>tool(b.dataset.t));
 try{const s=JSON.parse(localStorage.xview||'{}');if(s.grid)tool('grid');if(s.cross)tool('cross');if(s.mir)tool('mir');for(let i=0;i<(s.rot||0)/90;i++)tool('rot')}catch(e){}
-addEventListener('keydown',e=>{if(e.target.matches('input,select,textarea'))return;const k=e.key.toLowerCase();
+addEventListener('keydown',e=>{if(e.target.matches('input,select,textarea')||document.body.classList.contains('cmpMode'))return;const k=e.key.toLowerCase();
   if(k==='s')snap();else if(k==='r')toggleRec();else if(k==='f')tool('full');else if(k==='g')tool('grid');else if(k==='c')tool('cross');else if(k==='p')tool('pause');else if(k==='0')tool('fit')});
 
 // ---------- focus helper + histogram (from /frame.jpg) ----------
@@ -1641,6 +2435,7 @@ async function poll(){const s=await api('/api/state');if(s&&s.pc){P=s.pc;B=s.boa
     const g=$('#recGo');g.classList.toggle('on',!!r);g.textContent=r?'Stop recording':'Start recording';
     $('#recInfo').innerHTML=r?[['File',r.file],['Time',mmss(r.secs)],['Frames',r.frames],['Size',r.mb.toFixed(1)+' MB'],['Frame rate',r.tl?'1 every '+r.tl+' s':r.fps+' fps'],['Sound',r.audio?'yes':'no']].map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join(''):`<span>Folder</span><b title="${P.videos}">${P.videos}</b>`;
     const micOn=B&&B.mic;$('#micState').textContent=micOn?'on':'off';$('#vu').style.width=micOn?Math.min(100,P.level*130)+'%':'0';$('#micHint').textContent=micOn?'Level from the board microphone.':'Turn the mic on in the Record tab.';
+    updCrazy(s.crazy);
     if(P.msg&&P.msg!==poll.msg){if(poll.msg!==undefined)toast(P.msg);poll.msg=P.msg}}
   refresh()}
 TABS.forEach(([id,label,items],i)=>{
@@ -1650,6 +2445,7 @@ TABS.forEach(([id,label,items],i)=>{
 });
 if(localStorage.xtab){const b=document.querySelector(`#tabs button[data-id="${localStorage.xtab}"]`);if(b)b.click()}
 
+initCompare();
 setInterval(poll,500);poll();
 $('#snapTop').onclick=snap;$('#recBtnTop').onclick=toggleRec;
 $('#quitTop').onclick=async()=>{if(!$('#quitTop').dataset.arm){$('#quitTop').dataset.arm=1;$('#quitTop').textContent='Click to confirm';setTimeout(()=>{delete $('#quitTop').dataset.arm;$('#quitTop').textContent='Quit'},3000);return}
@@ -1731,14 +2527,14 @@ function Flash-Firmware {
 
 function Start-Studio([bool]$demo) {
   Say "Starting XIAO CAM Studio"
-  if (-not ('XHub' -as [type])) { Add-Type -TypeDefinition $StudioCs -ReferencedAssemblies System.Drawing, System.Management }
+  if (-not ('XHub' -as [type])) { Add-Type -TypeDefinition $StudioCs -ReferencedAssemblies System.Drawing, System.Management, System.Web.Extensions, System.Windows.Forms }
   $hub = New-Object XHub
   $hub.Html = $Html
   $hub.PicturesDir = Join-Path $Root 'pictures'
   $hub.VideosDir = Join-Path $Root 'videos'
   $hub.Demo = $demo
   [XHub]::HookConsole($hub)
-  $hub.StartAll()
+  $hub.StartAll((Join-Path $Root 'crazy'))
   $web = New-Object XWeb $hub
   $port = $web.Start($StudioPort)
   $url = "http://127.0.0.1:$port/"

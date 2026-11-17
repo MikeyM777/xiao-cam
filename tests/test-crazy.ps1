@@ -50,4 +50,5 @@ Check 'star saved' (@($hub.Crazy.Stars()) -contains $r.shots[0].file)
 
 $hub.Shutdown()
 Remove-Item $out -Recurse -Force -ErrorAction SilentlyContinue
+Remove-Item (Join-Path $env:LOCALAPPDATA 'XiaoCam\studio.json') -ErrorAction SilentlyContinue
 if ($fail) { Write-Host "$fail FAILED" -ForegroundColor Red; exit 1 } else { Write-Host 'ALL PASS' -ForegroundColor Green }

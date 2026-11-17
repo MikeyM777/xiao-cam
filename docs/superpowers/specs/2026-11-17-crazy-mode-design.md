@@ -33,7 +33,9 @@ Profiles (UI normalizes each metric min-max over the photos being compared):
 - Night:    .35 exposure + .30 no-noise + .20 sharp + .15 no-clip
 - Indoor:   .30 exposure + .25 no-cast + .25 sharp + .20 no-noise
 - Fast:     .50 fps + .20 sharp + .20 exposure + .10 no-noise
-exposure = 1 - |mean - 0.45| / 0.45.
+exposure = 1 - |mean - 0.45| / 0.45. noise is used relative to brightness (noise / max(mean, 0.05)).
+Every profile score is multiplied by 0.4 + 0.6 * min(1, exposure / 0.6), so badly exposed photos never win.
+Firmware gets `set autosave 0|1` so the sweep does not wear the board flash (crazy mode turns it off while running).
 
 ## Files
 ```

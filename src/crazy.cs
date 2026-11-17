@@ -98,7 +98,7 @@ public static class XScore {
       for (int i = 0; i < n; i++) o[i] = mx - mn < 1e-9 ? 0.5 : (f(list[i]) - mn) / (mx - mn);
       return o;
     };
-    double[] sh = norm(x => x.Sharp), no = norm(x => x.Noise), cl = norm(x => x.Clip), ca = norm(x => x.Cast), fp = norm(x => x.Fps);
+    double[] sh = norm(x => x.Sharp), no = norm(x => x.Noise / Math.Max(x.Mean, 0.05)), cl = norm(x => x.Clip), ca = norm(x => x.Cast), fp = norm(x => x.Fps);
     for (int i = 0; i < n; i++) {
       double ex = Math.Max(0, 1 - Math.Abs(list[i].Mean - 0.45) / 0.45);
       switch (profile) {
@@ -107,6 +107,7 @@ public static class XScore {
         case "indoor":   r[i] = .30 * ex + .25 * (1 - ca[i]) + .25 * sh[i] + .20 * (1 - no[i]); break;
         default:         r[i] = .50 * fp[i] + .20 * sh[i] + .20 * ex + .10 * (1 - no[i]); break;
       }
+      r[i] *= 0.4 + 0.6 * Math.Min(1, ex / 0.6);   // too dark / too bright is never "best"
     }
     return r;
   }
