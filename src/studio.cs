@@ -34,13 +34,19 @@ public class XHub {
   public volatile float Level;
   public DateTime LastCfgAt = DateTime.MinValue, LastFrameAt = DateTime.MinValue;
   readonly object fl = new object(), sl = new object(), rl = new object();
-  byte[] frame; long seq; int fw, fh;
+  byte[] frame; long seq; int fw, fh; DateTime frameAt;
+  public XCrazy Crazy;
+  public bool IsLive { get { return (DateTime.Now - LastFrameAt).TotalSeconds < 2; } }
+  public long TotalFrames { get { return Interlocked.Read(ref totalFrames); } }
+  public byte[] LatestWithTime(out DateTime at, out int w, out int h) { lock (fl) { at = frameAt; w = fw; h = fh; return frame; } }
   int winFrames; long winBytes; double fps, kbps;
   float peak; int peakN;
   long totalFrames;
   volatile bool shutdown;
 
-  public void StartAll() {
+  public void StartAll(string crazyDefault) {
+    Crazy = new XCrazy(this);
+    Crazy.LoadDir(crazyDefault);
     StartSource();
     var t = new Thread(TickLoop); t.IsBackground = true; t.Start();
   }
@@ -63,8 +69,9 @@ public class XHub {
   public void OnFrame(byte[] jpg) {
     int w, h;
     XJpeg.Size(jpg, out w, out h);
-    lock (fl) { frame = jpg; seq++; fw = w; fh = h; Monitor.PulseAll(fl); }
-    LastFrameAt = DateTime.Now; totalFrames++;
+    DateTime now = DateTime.Now;
+    lock (fl) { frame = jpg; seq++; fw = w; fh = h; frameAt = now; Monitor.PulseAll(fl); }
+    LastFrameAt = now; Interlocked.Increment(ref totalFrames);
     lock (sl) { winFrames++; winBytes += jpg.Length; }
     XAvi r = Rec;
     if (r != null) { try { r.AddVideo(jpg, w, h); } catch (Exception e) { LastMsg = "recording error: " + e.Message; StopRec(); } }
@@ -123,6 +130,7 @@ public class XHub {
   }
   public void Shutdown() {
     shutdown = true;
+    XCrazy cz = Crazy; if (cz != null) cz.StopAndWait(8000);
     StopRec();
     IXSource s = Source; if (s != null) s.Stop();
   }
@@ -175,7 +183,8 @@ public class XHub {
       sb.Append(",\"tl\":").Append(N(r.TlSec));
       sb.Append(",\"part\":").Append(r.Part).Append("}");
     } else sb.Append(",\"rec\":null");
-    sb.Append("},\"board\":");
+    sb.Append("},\"crazy\":").Append(Crazy == null ? "null" : Crazy.StateJson());
+    sb.Append(",\"board\":");
     string b = BoardJson;
     sb.Append(string.IsNullOrEmpty(b) ? "null" : b);
     sb.Append("}");
@@ -397,7 +406,11 @@ public class XDemo : IXSource {
         }
       } else audioDone = (long)(t * 16000);
       int fl = Get("fps_limit");
-      double period = 1.0 / (fl > 0 ? Math.Min(fl, 25) : 20);
+      int dfs = Get("framesize");
+      double dfps = 25 * Math.Pow(480000.0 / (SW[dfs] * SH[dfs]), 0.7) * Math.Pow(Math.Max(4, Get("quality")) / 10.0, 0.3) * Get("xclk") / 20.0;
+      dfps = Math.Max(2, Math.Min(25, dfps));
+      if (fl > 0) dfps = Math.Min(dfps, fl);
+      double period = 1.0 / dfps;
       if (t >= nextFrame && Get("usb") == 1) {
         nextFrame = t + period;
         try { hub.OnFrame(Render(t, jpg)); fpsN++; } catch (Exception e) { hub.OnMsg("demo: " + e.Message); }
@@ -407,7 +420,7 @@ public class XDemo : IXSource {
   }
   public byte[] Render(double t, ImageCodecInfo codec) {
     int fs = Get("framesize"); int w = SW[fs], h = SH[fs];
-    int br = Get("brightness"), sat = Get("saturation");
+    int br = 0, sat = 0;
     using (var bmp = new Bitmap(w, h, PixelFormat.Format24bppRgb))
     using (var g = Graphics.FromImage(bmp)) {
       g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -432,6 +445,34 @@ public class XDemo : IXSource {
       using (var tb = new SolidBrush(Color.White)) {
         g.DrawString("DEMO  " + w + "x" + h + "  q" + Get("quality"), font, tb, w * 0.03f, h * 0.04f);
         g.DrawString(DateTime.Now.ToString("HH:mm:ss.f"), font, tb, w * 0.03f, h * 0.04f + fsz * 1.6f);
+      }
+      // camera model: exposure, gain, noise, color
+      double lum;
+      if (Get("aec") == 1) lum = 0.45 + Get("ae_level") * 0.08 + (Get("aec2") == 1 ? 0.03 : 0);
+      else lum = 0.55 * Get("aec_value") / 400.0 * (Get("agc") == 1 ? 1 + Get("gainceiling") * 0.3 : Get("agc_gain") + 1);
+      lum += Get("brightness") * 0.05;
+      float k = (float)(lum / 0.45), ct = 1 + Get("contrast") * 0.15f, st = Get("effect") == 2 ? 0 : 1 + Get("saturation") * 0.25f;
+      float tr = 0, tbl = 0; int wm = Get("wb_mode");
+      if (Get("awb") == 0) tbl = 0.08f; else if (Get("awb_gain") == 1) { if (wm == 1) tr = 0.05f; else if (wm == 2) tr = 0.08f; else if (wm == 3) tbl = 0.05f; else if (wm == 4) tr = 0.1f; }
+      float lr = 0.299f, lg = 0.587f, lb = 0.114f;
+      float a = (1 - st) * lr, b2 = (1 - st) * lg, c2 = (1 - st) * lb;
+      var cm = new ColorMatrix(new float[][] {
+        new float[] { (a + st) * k * ct, a * k * ct, a * k * ct, 0, 0 },
+        new float[] { b2 * k * ct, (b2 + st) * k * ct, b2 * k * ct, 0, 0 },
+        new float[] { c2 * k * ct, c2 * k * ct, (c2 + st) * k * ct, 0, 0 },
+        new float[] { 0, 0, 0, 1, 0 },
+        new float[] { 0.5f * (1 - ct) + tr, 0.5f * (1 - ct), 0.5f * (1 - ct) + tbl, 0, 1 } });
+      using (var src = (Bitmap)bmp.Clone())
+      using (var ia = new ImageAttributes()) {
+        ia.SetColorMatrix(cm);
+        g.DrawImage(src, new Rectangle(0, 0, w, h), 0, 0, w, h, GraphicsUnit.Pixel, ia);
+      }
+      double noise = (Get("agc") == 1 ? Get("gainceiling") * 0.02 : Get("agc_gain") * 0.015) * (1 - Get("denoise") / 10.0);
+      if (noise > 0) {
+        var rnd = new Random();
+        int nd = (int)(noise * w * h / 6);
+        using (var nb = new SolidBrush(Color.Black))
+          for (int i = 0; i < nd; i++) { int gv = rnd.Next(256); nb.Color = Color.FromArgb(150, gv, gv, gv); g.FillRectangle(nb, rnd.Next(w), rnd.Next(h), 2, 2); }
       }
       if (Get("hmirror") == 1) bmp.RotateFlip(RotateFlipType.RotateNoneFlipX);
       if (Get("vflip") == 0) bmp.RotateFlip(RotateFlipType.RotateNoneFlipY);
@@ -703,6 +744,40 @@ public class XWeb {
         else if (p == "auto" || Regex.IsMatch(p, "^COM[0-9]{1,3}$")) { hub.Demo = false; hub.WantPort = p; }
         else { Json(ns, Ok(false, null)); return; }
         hub.StartSource(); Json(ns, Ok(true, null)); return;
+      }
+      case "/api/crazy/start":
+        try { hub.Crazy.Quick = G(q, "quick") == "1"; hub.Crazy.MaxRounds = (int)D(q, "rounds", 0); hub.Crazy.Start(); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/crazy/stop": hub.Crazy.Stop(); Json(ns, Ok(true, null)); return;
+      case "/api/crazy/folder":
+        try {
+          string d = G(q, "pick") == "1" ? XCrazy.PickFolder(hub.Crazy.OutDir) : G(q, "path");
+          if (d == null) { Json(ns, Ok(false, "\"err\":\"cancelled\"")); return; }
+          d = hub.Crazy.SetDir(d.Trim());
+          Json(ns, Ok(true, "\"dir\":\"" + XHub.Esc(d) + "\""));
+        } catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/crazy/open":
+        try { Directory.CreateDirectory(hub.Crazy.OutDir); Process.Start("explorer.exe", "\"" + hub.Crazy.OutDir + "\""); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/crazy/rounds": Json(ns, hub.Crazy.RoundsJson()); return;
+      case "/api/crazy/round": {
+        string j = hub.Crazy.RoundJson(G(q, "id"));
+        if (j == null) Send(ns, "404 Not Found", "application/json", Encoding.ASCII.GetBytes("{\"ok\":false}")); else Json(ns, j);
+        return;
+      }
+      case "/api/crazy/stars": Json(ns, XCrazy.Js().Serialize(hub.Crazy.Stars())); return;
+      case "/api/crazy/star":
+        try { hub.Crazy.Star(G(q, "p"), G(q, "on") == "1"); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/crazy/file": {
+        string f = hub.Crazy.SafeFile(G(q, "p"));
+        if (f == null) Send(ns, "403 Forbidden", "text/plain", Encoding.ASCII.GetBytes("no"));
+        else Send(ns, "200 OK", "image/jpeg", File.ReadAllBytes(f));
+        return;
       }
       case "/api/quit": {
         Json(ns, Ok(true, null));

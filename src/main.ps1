@@ -141,14 +141,14 @@ function Flash-Firmware {
 
 function Start-Studio([bool]$demo) {
   Say "Starting XIAO CAM Studio"
-  if (-not ('XHub' -as [type])) { Add-Type -TypeDefinition $StudioCs -ReferencedAssemblies System.Drawing, System.Management }
+  if (-not ('XHub' -as [type])) { Add-Type -TypeDefinition $StudioCs -ReferencedAssemblies System.Drawing, System.Management, System.Web.Extensions, System.Windows.Forms }
   $hub = New-Object XHub
   $hub.Html = $Html
   $hub.PicturesDir = Join-Path $Root 'pictures'
   $hub.VideosDir = Join-Path $Root 'videos'
   $hub.Demo = $demo
   [XHub]::HookConsole($hub)
-  $hub.StartAll()
+  $hub.StartAll((Join-Path $Root 'crazy'))
   $web = New-Object XWeb $hub
   $port = $web.Start($StudioPort)
   $url = "http://127.0.0.1:$port/"

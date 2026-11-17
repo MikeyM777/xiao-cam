@@ -31,7 +31,7 @@ static String apSsid = "@@SSID@@", apPass = "@@PASS@@", staSsid = "", staPass = 
 static volatile int capFrames = 0, streamClients = 0;
 static float capFps = 0, usbFps = 0;
 static int usbFrames = 0;
-static bool dirty = false, cfgNow = true, webStarted = false;
+static bool dirty = false, cfgNow = true, webStarted = false, autosave = true;
 static uint32_t dirtyAt = 0;
 static volatile bool micRunning = false, micBusy = false;
 
@@ -123,7 +123,7 @@ static void saveAll() {
   prefs.end();
   dirty = false;
 }
-static void markDirty() { dirty = true; dirtyAt = millis(); }
+static void markDirty() { if (autosave) { dirty = true; dirtyAt = millis(); } }
 
 // ---------- camera ----------
 static bool camInitSize(framesize_t fs) {
@@ -362,7 +362,8 @@ static void sendAudio() {
 }
 
 static void setValue(const char* k, int v) {
-  if (!strcmp(k, "fps_limit")) fpsLimit = constrain(v, 0, 60);
+  if (!strcmp(k, "autosave")) autosave = v != 0;   // PC crazy mode turns this off: no flash wear
+  else if (!strcmp(k, "fps_limit")) fpsLimit = constrain(v, 0, 60);
   else if (!strcmp(k, "xclk")) {
     xclkMhz = constrain(v, 4, 24);
     if (camOk) { sensor_t* s = esp_camera_sensor_get(); if (s->set_xclk) s->set_xclk(s, LEDC_TIMER_0, xclkMhz); }
