@@ -68,3 +68,16 @@ Demo source must honor all settings it can (resolution, quality, brightness, man
 darken/brighten + noise) so a demo crazy round produces different photos and scores. Verify: demo round
 completes, folders/json written, compare page loads it, apply-to-camera sends the settings,
 path traversal on /crazy/file is refused, base settings restored after Stop.
+
+## Update 2026-11-18: clips + WiFi crazy mode (owner request)
+- Every test is a 5-second clip saved on the PC (AVI MJPEG at nominal 30 fps, empty chunks keep the real
+  arrival timing so freezes stay frozen) + `<name>.json` index (frame time, byte offset, length, delay) + thumb.
+- Mode "WiFi": PC joins the camera hotspot, USB stays plugged in for control; USB video off during the round;
+  the Studio reads `http://<ap_ip>:81/stream` like a phone. Firmware 2.2 adds `X-Timestamp` (capture time)
+  per stream part and a `ping` command (XPNG reply) for clock sync -> delay = arrival - capture.
+- WiFi plan: resolution x quality (7x5), fps limit 5..25, WiFi power 2..21 dBm, clock; mix per WiFi profile.
+- Metrics per clip: fps, KB/s, freezes (gap > max(3x median, 250 ms)), longest gap, jitter, delay median/90%.
+- WiFi profiles: smooth (.6 fps .25 no-freeze .15 no-long-gap), low delay (.6 delay .2 delay90 .2 fps),
+  no freezes (.45 freezes .35 longest gap .2 jitter), best picture (sharp/exposure/noise x min(1,fps/10) x 0.7 if any freeze).
+- Compare: USB/WiFi filter, synced clip player (play/pause/seek/frame step/speed) in side-by-side and A/B wipe.
+- Disk guard: stops when less than 5 GB free.

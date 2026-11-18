@@ -833,7 +833,7 @@ public class XWeb {
       case "/crazy/file": {
         string f = hub.Crazy.SafeFile(G(q, "p"));
         if (f == null) Send(ns, "403 Forbidden", "text/plain", Encoding.ASCII.GetBytes("no"));
-        else Send(ns, "200 OK", "image/jpeg", File.ReadAllBytes(f));
+        else { string e = Path.GetExtension(f).ToLowerInvariant(); Send(ns, "200 OK", e == ".json" ? "application/json" : e == ".avi" ? "video/x-msvideo" : "image/jpeg", File.ReadAllBytes(f)); }
         return;
       }
       case "/api/update/check": Json(ns, XUpdate.Check(hub)); return;

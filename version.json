@@ -1,5 +1,5 @@
 {
-  "firmware": "2.1",
-  "notes": "Flash fix (closes an open Studio that holds the port), Update button, Flash firmware button",
-  "studio": "2.2.0"
+  "studio": "2.3.0",
+  "firmware": "2.2",
+  "notes": "Crazy mode records 5-second clips. New: WiFi crazy mode (PC on the camera hotspot, USB for control) measuring fps, freezes, delay. Compare plays 2-4 clips in sync. Camera firmware 2.2 (flashes automatically)."
 }

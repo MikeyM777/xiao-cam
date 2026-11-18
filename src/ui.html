@@ -212,7 +212,7 @@ const COLOR=[
 ];
 const TABS=[['image','Image',IMAGE],['light','Light',LIGHT],['color','Color',COLOR],['crazy','Crazy',crazyPane],['rec','Record',recPane],['wifi','WiFi',wifiPane],['board','Board',boardPane]];
 // ---------- presets + profiles ----------
-const SENSOR_KEYS=['framesize','quality','fps_limit','brightness','contrast','saturation','sharpness','denoise','effect','awb','awb_gain','wb_mode','aec','aec2','ae_level','aec_value','agc','agc_gain','gainceiling','bpc','wpc','raw_gma','lenc','hmirror','vflip','dcw','xclk'];
+const SENSOR_KEYS=['framesize','quality','fps_limit','brightness','contrast','saturation','sharpness','denoise','effect','awb','awb_gain','wb_mode','aec','aec2','ae_level','aec_value','agc','agc_gain','gainceiling','bpc','wpc','raw_gma','lenc','hmirror','vflip','dcw','xclk','tx_power'];
 async function applySet(o){for(const k of SENSOR_KEYS)if(k in o){pend[k]={v:+o[k],t:Date.now()};await api('/api/set?k='+k+'&v='+o[k])}refresh()}
 function presets(p){const g=el('div','presets');
   const L=[['Fast','VGA, smooth video',{framesize:10,quality:12,fps_limit:0}],['Balanced','HD 1280x720',{framesize:13,quality:10,fps_limit:0}],
