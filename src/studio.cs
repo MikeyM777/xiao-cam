@@ -27,6 +27,7 @@ public class XHub {
   public volatile string Status = "starting";
   public volatile string BoardJson = "";
   public volatile string LastMsg = "";
+  public volatile string SendErr = "";
   public volatile bool Demo;
   public string WantPort = "auto";
   public IXSource Source;
@@ -68,7 +69,7 @@ public class XHub {
   public void StartSource() {
     IXSource old = Source;
     if (old != null) old.Stop();
-    BoardJson = "";
+    BoardJson = ""; SendErr = "";
     Source = Demo ? (IXSource)new XDemo(this) : new XSerial(this, WantPort);
     Source.Start();
   }
@@ -182,6 +183,7 @@ public class XHub {
     sb.Append(",\"want\":\"").Append(Esc(WantPort)).Append("\"");
     sb.Append(",\"status\":\"").Append(Esc(Status)).Append("\"");
     sb.Append(",\"msg\":\"").Append(Esc(LastMsg)).Append("\"");
+    sb.Append(",\"sendErr\":\"").Append(Esc(conn ? SendErr : "")).Append("\"");
     sb.Append(",\"fps\":").Append(N(f)).Append(",\"kbps\":").Append(N(k));
     sb.Append(",\"kb\":").Append(fr == null ? "0" : N(fr.Length / 1024.0));
     sb.Append(",\"w\":").Append(w).Append(",\"h\":").Append(h);
@@ -250,9 +252,14 @@ public class XSerial : IXSource {
   public void Stop() { running = false; connected = false; try { if (sp != null) sp.Close(); } catch { } }
   public bool Send(string line) {
     SerialPort s = sp;
-    if (s == null || !s.IsOpen) return false;
-    try { byte[] b = Encoding.UTF8.GetBytes(line + "\n"); lock (wl) { s.BaseStream.Write(b, 0, b.Length); } return true; }
-    catch { return false; }
+    if (s == null || !s.IsOpen) { hub.SendErr = "USB port is not open"; return false; }
+    byte[] b = Encoding.UTF8.GetBytes(line + "\n");
+    for (int tryN = 0; tryN < 2; tryN++) {
+      try { lock (wl) { s.BaseStream.Write(b, 0, b.Length); } hub.SendErr = ""; return true; }
+      catch (TimeoutException) { hub.SendErr = "the camera does not read commands (old firmware? press Flash firmware)"; }
+      catch (Exception e) { hub.SendErr = e.Message.Trim(); Thread.Sleep(150); }
+    }
+    return false;
   }
 
   public static string FindPort() {

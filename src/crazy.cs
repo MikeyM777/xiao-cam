@@ -301,7 +301,7 @@ public class XCrazy {
   public void Start() {
     if (running) return;
     if (string.IsNullOrEmpty(OutDir)) throw new Exception("choose an output folder first");
-    if (ReadBoard() == null) throw new Exception("camera not connected over USB (or old firmware - flash with option 1)");
+    if (ReadBoard() == null) throw new Exception(hub.IsLive ? "the camera runs OLD firmware (pictures but no settings) - press Flash firmware now at the top, then start again" : "camera not connected over USB");
     if (Mode == "usb" && !hub.IsLive) throw new Exception("no picture coming from the camera");
     if (Mode == "wifi") { string u = StreamUrl(); if (!XWifi.Reachable(u, 2500)) throw new Exception("cannot reach the camera WiFi video at " + u + " - connect this PC to the XIAO-CAM WiFi first"); }
     Directory.CreateDirectory(OutDir);

@@ -26,7 +26,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$StudioVersion   = '2.3.0'      # bump on every release (Update button compares this)
+$StudioVersion   = '2.3.1'      # bump on every release (Update button compares this)
 $FirmwareVersion = '2.2'        # bump when the sketch below changes (Studio then asks to flash)
 $Ssid = 'XIAO-CAM'            # first-time hotspot name (change later in the Studio, WiFi tab)
 $Pass = 'xiaocam123'          # first-time hotspot password: at least 8 characters
@@ -557,6 +557,7 @@ public class XHub {
   public volatile string Status = "starting";
   public volatile string BoardJson = "";
   public volatile string LastMsg = "";
+  public volatile string SendErr = "";
   public volatile bool Demo;
   public string WantPort = "auto";
   public IXSource Source;
@@ -598,7 +599,7 @@ public class XHub {
   public void StartSource() {
     IXSource old = Source;
     if (old != null) old.Stop();
-    BoardJson = "";
+    BoardJson = ""; SendErr = "";
     Source = Demo ? (IXSource)new XDemo(this) : new XSerial(this, WantPort);
     Source.Start();
   }
@@ -712,6 +713,7 @@ public class XHub {
     sb.Append(",\"want\":\"").Append(Esc(WantPort)).Append("\"");
     sb.Append(",\"status\":\"").Append(Esc(Status)).Append("\"");
     sb.Append(",\"msg\":\"").Append(Esc(LastMsg)).Append("\"");
+    sb.Append(",\"sendErr\":\"").Append(Esc(conn ? SendErr : "")).Append("\"");
     sb.Append(",\"fps\":").Append(N(f)).Append(",\"kbps\":").Append(N(k));
     sb.Append(",\"kb\":").Append(fr == null ? "0" : N(fr.Length / 1024.0));
     sb.Append(",\"w\":").Append(w).Append(",\"h\":").Append(h);
@@ -780,9 +782,14 @@ public class XSerial : IXSource {
   public void Stop() { running = false; connected = false; try { if (sp != null) sp.Close(); } catch { } }
   public bool Send(string line) {
     SerialPort s = sp;
-    if (s == null || !s.IsOpen) return false;
-    try { byte[] b = Encoding.UTF8.GetBytes(line + "\n"); lock (wl) { s.BaseStream.Write(b, 0, b.Length); } return true; }
-    catch { return false; }
+    if (s == null || !s.IsOpen) { hub.SendErr = "USB port is not open"; return false; }
+    byte[] b = Encoding.UTF8.GetBytes(line + "\n");
+    for (int tryN = 0; tryN < 2; tryN++) {
+      try { lock (wl) { s.BaseStream.Write(b, 0, b.Length); } hub.SendErr = ""; return true; }
+      catch (TimeoutException) { hub.SendErr = "the camera does not read commands (old firmware? press Flash firmware)"; }
+      catch (Exception e) { hub.SendErr = e.Message.Trim(); Thread.Sleep(150); }
+    }
+    return false;
   }
 
   public static string FindPort() {
@@ -1704,7 +1711,7 @@ public class XCrazy {
   public void Start() {
     if (running) return;
     if (string.IsNullOrEmpty(OutDir)) throw new Exception("choose an output folder first");
-    if (ReadBoard() == null) throw new Exception("camera not connected over USB (or old firmware - flash with option 1)");
+    if (ReadBoard() == null) throw new Exception(hub.IsLive ? "the camera runs OLD firmware (pictures but no settings) - press Flash firmware now at the top, then start again" : "camera not connected over USB");
     if (Mode == "usb" && !hub.IsLive) throw new Exception("no picture coming from the camera");
     if (Mode == "wifi") { string u = StreamUrl(); if (!XWifi.Reachable(u, 2500)) throw new Exception("cannot reach the camera WiFi video at " + u + " - connect this PC to the XIAO-CAM WiFi first"); }
     Directory.CreateDirectory(OutDir);
@@ -2624,11 +2631,13 @@ function initCompare(){
 const $=s=>document.querySelector(s);
 const el=(t,c,h)=>{const e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e};
 let B=null,P=null;const pend={};const upd=[];
+const two=(b,label,fn)=>{b.onclick=()=>{if(!b.dataset.arm){b.dataset.arm=1;const t=b.textContent;b.textContent=label;setTimeout(()=>{delete b.dataset.arm;b.textContent=t},3000);return}delete b.dataset.arm;fn()}};
 const SN=['96x96','QQVGA','128x128','QCIF','HQVGA','240x240','QVGA','320x320','CIF','HVGA','VGA','SVGA','XGA','HD','SXGA','UXGA','FHD','Portrait HD','Portrait 3MP','QXGA (3MP)','QHD','WQXGA','Portrait FHD','QSXGA','5MP'];
 async function api(p){try{const r=await fetch(p,{cache:'no-store'});return await r.json()}catch(e){return{ok:false,err:String(e)}}}
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');clearTimeout(toast.t);toast.t=setTimeout(()=>t.classList.remove('on'),2600)}
 function bv(k){const p=pend[k];if(p&&Date.now()-p.t<2500)return p.v;return B?B[k]:undefined}
-async function setv(k,v){pend[k]={v:+v,t:Date.now()};refresh();const r=await api('/api/set?k='+k+'&v='+v);if(!r.ok)toast('Not sent - camera not connected')}
+async function setv(k,v){pend[k]={v:+v,t:Date.now()};refresh();const r=await api('/api/set?k='+k+'&v='+v);if(!r.ok)toast(noSendMsg())}
+function noSendMsg(){return !P||!P.connected?'Not sent - camera not connected':P.oldfw?'Not sent - old firmware on the camera: press Flash firmware now (top)':'Not sent - '+(P.sendErr||'camera did not accept it')}
 function fmt(it,v){return it.fmt?it.fmt(+v):(it.min<0&&v>0?'+'+v:''+v)}
 
 // ---------- control builders ----------
@@ -2761,7 +2770,7 @@ function wifiPane(p){
     await api('/api/str?k=ap_ssid&v='+encodeURIComponent(ss));await api('/api/str?k=ap_pass&v='+encodeURIComponent(ap));
     await api('/api/str?k=sta_ssid&v='+encodeURIComponent($('#wStS').value.trim()));await api('/api/str?k=sta_pass&v='+encodeURIComponent($('#wStP').value));
     await api('/api/set?k=ap_ch&v='+$('#wCh').value);const r=await api('/api/cmd?c=wifi_apply');
-    p.querySelectorAll('[data-dirty]').forEach(i=>delete i.dataset.dirty);toast(r.ok?'WiFi settings sent':'Not sent - camera not connected')};
+    p.querySelectorAll('[data-dirty]').forEach(i=>delete i.dataset.dirty);toast(r.ok?'WiFi settings sent':noSendMsg())};
 }
 const STA={'-1':'not used','0':'idle','1':'network not found','2':'scan done','3':'connected','4':'wrong password / failed','5':'connection lost','6':'disconnected','255':'off'};
 function updWifi(){if(!B)return;const m=bv('wifi');document.querySelectorAll('#wMode button').forEach(b=>b.classList.toggle('on',+b.dataset.v===m));
@@ -2801,7 +2810,6 @@ function boardPane(p){
   p.querySelector('#bRe').onclick=async()=>{const r=await api('/api/port?p='+$('#bPort').value);toast(r.ok?'Reconnecting...':'Bad port')};
   p.querySelector('#profSave').onclick=()=>{const n=$('#profName').value.trim();if(!n||!B){toast(B?'Type a name first':'Camera not connected');return}const o={};SENSOR_KEYS.forEach(k=>{if(B[k]!==undefined)o[k]=B[k]});const P_=profs();P_[n]=o;localStorage.xprof=JSON.stringify(P_);$('#profName').value='';drawProfs();toast('Profile saved: '+n)};
   p.querySelector('#upChk').onclick=()=>checkUpd(false);
-  const two=(b,label,fn)=>{b.onclick=()=>{if(!b.dataset.arm){b.dataset.arm=1;const t=b.textContent;b.textContent=label;setTimeout(()=>{delete b.dataset.arm;b.textContent=t},3000);return}delete b.dataset.arm;fn()}};
   two(p.querySelector('#upGo'),'Click again to update',async()=>{const flash=!!(UP&&UP.firmware&&B&&B.fw!==UP.firmware);const r=await api('/api/update/apply?flash='+(flash?1:0));
     toast(r.ok?'Updating - the studio restarts in a new window'+(flash?' and flashes the camera':'')+'. This page reconnects by itself.':'Update failed: '+(r.err||''))});
   two(p.querySelector('#fwGo'),'Click again to flash',async()=>{const r=await api('/api/flash');toast(r.ok?'Flashing - watch the new black window. This page reconnects by itself.':'Cannot flash: '+(r.err||''))});
@@ -2882,10 +2890,14 @@ async function poll(){const s=await api('/api/state');if(s&&s.pc){if(poll.down){
     $('#cTemp').textContent=B?B.temp.toFixed?B.temp.toFixed(0)+' C':B.temp+' C':'-';
     $('#empty').style.display=P.live||V.pause?'none':'flex';$('#emptyTxt').textContent=P.connected?(P.oldfw?'Old firmware on the camera.':'Connected - waiting for pictures...'):'Plug the XIAO in with a USB-C data cable.';
     if(P.live&&!lastLive&&!V.pause)startStream();lastLive=P.live;
-    const ban=$('#banner');let bt='';
-    if(P.oldfw)bt='The camera runs the OLD firmware - settings will not work. Close this, run the bat and choose 1 (flash).';
+    const ban=$('#banner');let bt='',fl=false;
+    if(P.oldfw){bt='The camera runs the OLD firmware - settings and Crazy mode cannot work until you flash it.';fl=true}
+    else if(B&&!P.demo&&P.fwExpected&&B.fw&&B.fw!==P.fwExpected){bt='Camera firmware '+B.fw+' is older than this Studio needs ('+P.fwExpected+').';fl=true}
+    else if(P.sendErr)bt='Cannot send to the camera: '+P.sendErr;
     else if(B&&!B.cam)bt='Camera problem: '+B.cam_err;
-    ban.style.display=bt?'block':'none';ban.textContent=bt;
+    const key=bt+fl;if(ban.dataset.k!==key){ban.dataset.k=key;ban.style.display=bt?'block':'none';ban.textContent=bt;
+      if(fl){const b=document.createElement('button');b.className='pri';b.style.marginLeft='10px';b.textContent='Flash firmware now';
+        two(b,'Click again to flash',async()=>{const r=await api('/api/flash');toast(r.ok?'Flashing - watch the new black window. This page reconnects by itself.':'Cannot flash: '+(r.err||''))});ban.appendChild(b)}}
     const r=P.rec;$('#recBtnTop').classList.toggle('on',!!r);$('#recTopTxt').textContent=r?'STOP  '+mmss(r.secs):'REC';
     $('#recbadge').style.display=r?'flex':'none';if(r)$('#recBadgeTxt').textContent=(r.tl?'TIMELAPSE ':'REC ')+mmss(r.secs)+'  '+r.mb.toFixed(1)+' MB';
     const g=$('#recGo');g.classList.toggle('on',!!r);g.textContent=r?'Stop recording':'Start recording';

@@ -1,5 +1,5 @@
 {
-  "studio": "2.3.0",
-  "firmware": "2.2",
-  "notes": "Crazy mode records 5-second clips. New: WiFi crazy mode (PC on the camera hotspot, USB for control) measuring fps, freezes, delay. Compare plays 2-4 clips in sync. Camera firmware 2.2 (flashes automatically)."
+    "notes":  "Fix: when the camera runs old firmware the Studio now says so (instead of \"not connected\") and shows a Flash firmware now button at the top. Crazy mode and settings need the new firmware 2.2.",
+    "firmware":  "2.2",
+    "studio":  "2.3.1"
 }
