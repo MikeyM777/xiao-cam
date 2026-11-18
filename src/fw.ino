@@ -19,6 +19,7 @@ static I2SClass i2s;
 static SemaphoreHandle_t lock;
 static uint8_t* shared = nullptr;
 static size_t sharedLen = 0, sharedCap = 0;
+static uint32_t sharedTs = 0;            // capture time (board millis) of the frame in shared
 static volatile uint32_t frameId = 0;
 static bool camOk = false;
 static char camErr[96] = "";
@@ -181,7 +182,11 @@ static void captureTask(void*) {
       shared = (uint8_t*)bigAlloc(sharedCap);
       if (!shared) sharedCap = 0;
     }
-    if (shared) { memcpy(shared, fb->buf, fb->len); sharedLen = fb->len; frameId++; }
+    if (shared) {
+      memcpy(shared, fb->buf, fb->len); sharedLen = fb->len; frameId++;
+      uint32_t now = millis(), ts = (uint32_t)(fb->timestamp.tv_sec * 1000ULL + fb->timestamp.tv_usec / 1000);
+      sharedTs = (ts <= now && now - ts < 2000) ? ts : now;
+    }
     xSemaphoreGive(lock);
     esp_camera_fb_return(fb);
     capFrames++;
@@ -190,16 +195,18 @@ static void captureTask(void*) {
 }
 
 // copy the newest frame (if newer than 'seen') into a private buffer
-static size_t copyLatest(uint8_t*& buf, size_t& cap, uint32_t& seen) {
+static size_t copyLatestTs(uint8_t*& buf, size_t& cap, uint32_t& seen, uint32_t* ts) {
   size_t n = 0;
   xSemaphoreTake(lock, portMAX_DELAY);
   if (frameId != seen && sharedLen) {
     if (sharedLen > cap) { free(buf); cap = sharedLen + 32768; buf = (uint8_t*)bigAlloc(cap); if (!buf) cap = 0; }
-    if (buf) { memcpy(buf, shared, sharedLen); n = sharedLen; seen = frameId; }
+    if (buf) { memcpy(buf, shared, sharedLen); n = sharedLen; seen = frameId; if (ts) *ts = sharedTs; }
   }
   xSemaphoreGive(lock);
   return n;
 }
+
+static size_t copyLatest(uint8_t*& buf, size_t& cap, uint32_t& seen) { return copyLatestTs(buf, cap, seen, nullptr); }
 
 // ---------- microphone (PDM, CLK 42 / DATA 41) ----------
 static uint8_t aring[32768];               // power of 2
@@ -301,12 +308,12 @@ static esp_err_t streamHandler(httpd_req_t* r) {
   httpd_resp_set_type(r, "multipart/x-mixed-replace;boundary=" BOUNDARY);
   httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(r, "Cache-Control", "no-cache");
-  uint8_t* buf = nullptr; size_t cap = 0; uint32_t seen = 0; char hdr[100];
+  uint8_t* buf = nullptr; size_t cap = 0; uint32_t seen = 0, ts = 0; char hdr[160];
   streamClients++;
   for (;;) {
-    size_t n = copyLatest(buf, cap, seen);
+    size_t n = copyLatestTs(buf, cap, seen, &ts);
     if (!n) { vTaskDelay(5); continue; }
-    int hl = snprintf(hdr, sizeof hdr, "\r\n--" BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", (unsigned)n);
+    int hl = snprintf(hdr, sizeof hdr, "\r\n--" BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %lu\r\n\r\n", (unsigned)n, (unsigned long)ts);
     if (httpd_resp_send_chunk(r, hdr, hl) != ESP_OK) break;
     if (httpd_resp_send_chunk(r, (const char*)buf, n) != ESP_OK) break;
   }
@@ -405,6 +412,10 @@ static void runCmd(char* l) {
     setString(arg, v); markDirty();
   } else if (!strcmp(l, "wifi_apply")) { applyWifi(); markDirty(); }
   else if (!strcmp(l, "save")) saveAll();
+  else if (!strcmp(l, "ping")) {     // clock sync for WiFi delay measurement: echo the PC time + board millis
+    char r[48]; int n = snprintf(r, sizeof r, "%s %lu", arg ? arg : "0", (unsigned long)millis());
+    sendPacket("XPNG", (const uint8_t*)r, n); return;
+  }
   else if (!strcmp(l, "defaults")) { prefs.begin("xcam", false); prefs.clear(); prefs.end(); delay(100); ESP.restart(); }
   else if (!strcmp(l, "reboot")) { if (dirty) saveAll(); delay(100); ESP.restart(); }
   cfgNow = true;

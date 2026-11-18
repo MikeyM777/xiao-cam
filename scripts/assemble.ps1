@@ -1,6 +1,6 @@
 $s = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'src'
 $m = [IO.File]::ReadAllText("$s\main.ps1")
-$parts = @{ FW = @('fw.ino'); CS = @('studio.cs', 'crazy.cs', 'update.cs'); HTML = @('ui.html') }
+$parts = @{ FW = @('fw.ino'); CS = @('studio.cs', 'crazy.cs', 'wifi.cs', 'update.cs'); HTML = @('ui.html') }
 foreach ($k in $parts.Keys) {
   $c = (($parts[$k] | ForEach-Object { [IO.File]::ReadAllText("$s\$_").TrimEnd() }) -join "`n`n")
   if ($k -eq 'HTML') { $c = $c.Replace('<!--CRAZY-->', [IO.File]::ReadAllText("$s\crazy.html").TrimEnd()) }

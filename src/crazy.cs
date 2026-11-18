@@ -1,5 +1,5 @@
 // ============================================================================
-//  Crazy mode: nonstop settings sweep -> organized, scored photos
+//  Crazy mode: nonstop settings sweep -> organized, scored 5-second clips (USB or WiFi)
 // ============================================================================
 public class XStopEx : Exception { }
 
@@ -12,12 +12,15 @@ public class XShot {
 }
 
 public class XScores {
-  public double Sharp, Noise, Mean, Clip, Cast, Kb, Fps; public int W, H;
+  public double Sharp, Noise, Mean, Clip, Cast, Kb, Fps;
+  public double Kbps, Stalls, MaxGap, Jitter, LatMed = -1, LatP90 = -1, Dur; public int W, H, Frames;
   public Dictionary<string, object> ToDict() {
     var d = new Dictionary<string, object>();
     d["sharp"] = Math.Round(Sharp, 2); d["noise"] = Math.Round(Noise, 3); d["mean"] = Math.Round(Mean, 4);
     d["clip"] = Math.Round(Clip, 4); d["cast"] = Math.Round(Cast, 4); d["kb"] = Math.Round(Kb, 1);
     d["fps"] = Math.Round(Fps, 1); d["w"] = W; d["h"] = H;
+    d["kbps"] = Math.Round(Kbps); d["stalls"] = Stalls; d["maxgap"] = Math.Round(MaxGap); d["jitter"] = Math.Round(Jitter, 1);
+    d["lat"] = Math.Round(LatMed); d["lat90"] = Math.Round(LatP90); d["frames"] = Frames; d["dur"] = Math.Round(Dur, 2);
     return d;
   }
 }
@@ -88,6 +91,7 @@ public static class XScore {
 
   // profile score over a set of shots (each metric normalized min-max inside the set)
   public static readonly string[] Profiles = { "daylight", "night", "indoor", "fast" };
+  public static readonly string[] WifiProfiles = { "wifi_smooth", "wifi_delay", "wifi_stable", "wifi_picture" };
   public static double[] Rank(List<XScores> list, string profile) {
     int n = list.Count; var r = new double[n];
     if (n == 0) return r;
@@ -99,15 +103,20 @@ public static class XScore {
       return o;
     };
     double[] sh = norm(x => x.Sharp), no = norm(x => x.Noise / Math.Max(x.Mean, 0.05)), cl = norm(x => x.Clip), ca = norm(x => x.Cast), fp = norm(x => x.Fps);
+    double[] st = norm(x => x.Stalls), mg = norm(x => x.MaxGap), ji = norm(x => x.Jitter), la = norm(x => x.LatMed < 0 ? 1e6 : x.LatMed), l9 = norm(x => x.LatP90 < 0 ? 1e6 : x.LatP90);
     for (int i = 0; i < n; i++) {
       double ex = Math.Max(0, 1 - Math.Abs(list[i].Mean - 0.45) / 0.45);
       switch (profile) {
         case "daylight": r[i] = .35 * sh[i] + .25 * ex + .15 * (1 - ca[i]) + .15 * (1 - no[i]) + .10 * (1 - cl[i]); break;
         case "night":    r[i] = .35 * ex + .30 * (1 - no[i]) + .20 * sh[i] + .15 * (1 - cl[i]); break;
         case "indoor":   r[i] = .30 * ex + .25 * (1 - ca[i]) + .25 * sh[i] + .20 * (1 - no[i]); break;
-        default:         r[i] = .50 * fp[i] + .20 * sh[i] + .20 * ex + .10 * (1 - no[i]); break;
+        case "fast":     r[i] = .50 * fp[i] + .20 * sh[i] + .20 * ex + .10 * (1 - no[i]); break;
+        case "wifi_smooth":  r[i] = .60 * fp[i] + .25 * (1 - st[i]) + .15 * (1 - mg[i]); break;
+        case "wifi_delay":   r[i] = .60 * (1 - la[i]) + .20 * (1 - l9[i]) + .20 * fp[i]; break;
+        case "wifi_stable":  r[i] = .45 * (1 - st[i]) + .35 * (1 - mg[i]) + .20 * (1 - ji[i]); break;
+        default:             r[i] = (.55 * sh[i] + .25 * ex + .20 * (1 - no[i])) * Math.Min(1, list[i].Fps / 10) * (list[i].Stalls > 0 ? 0.7 : 1); break;   // wifi_picture
       }
-      r[i] *= 0.4 + 0.6 * Math.Min(1, ex / 0.6);   // too dark / too bright is never "best"
+      if (!profile.StartsWith("wifi") || profile == "wifi_picture") r[i] *= 0.4 + 0.6 * Math.Min(1, ex / 0.6);   // too dark / too bright is never "best"
     }
     return r;
   }
@@ -128,7 +137,7 @@ public class XCrazy {
   readonly object fileLock = new object();
   public static readonly string[] Keys = { "framesize", "quality", "xclk", "fps_limit", "brightness", "contrast", "saturation", "sharpness",
     "denoise", "effect", "aec", "aec_value", "aec2", "ae_level", "agc", "agc_gain", "gainceiling", "awb", "awb_gain", "wb_mode",
-    "bpc", "wpc", "raw_gma", "lenc", "hmirror", "vflip", "dcw", "colorbar" };
+    "bpc", "wpc", "raw_gma", "lenc", "hmirror", "vflip", "dcw", "colorbar", "tx_power", "usb" };
 
   public XCrazy(XHub h) { hub = h; }
   public bool Running { get { return running; } }
@@ -216,10 +225,32 @@ public class XCrazy {
     p.Add(new XShot("sweep", "brightness", "+2").S("brightness", 2));
     return p;
   }
-  // winners of the sweep, mixed: per profile, top 4 groups by score spread x top 2 values
-  public static List<XShot> MixPlan(List<XShot> shots, List<XScores> scores, int groupsPer, int valuesPer) {
+  // WiFi: only what matters for streaming
+  public static List<XShot> WifiPlan(int maxSize, List<int[]> sizes) {
+    var p = new List<XShot>();
+    int[] res = { 10, 11, 12, 13, 14, 15, 19 };
+    foreach (int r in res) {
+      if (r > maxSize || r >= sizes.Count) continue;
+      foreach (int q in new[] { 6, 10, 15, 20, 30 })
+        p.Add(new XShot("sweep", "res-quality", sizes[r][0] + "x" + sizes[r][1] + "_q" + q.ToString("00")).S("framesize", r).S("quality", q));
+    }
+    foreach (int f in new[] { 5, 10, 15, 20, 25 }) p.Add(new XShot("sweep", "fps-limit", f.ToString("00") + "fps").S("fps_limit", f));
+    int[] tx = { 8, 20, 44, 60, 78, 84 }; string[] txn = { "02dBm", "05dBm", "11dBm", "15dBm", "19.5dBm", "21dBm" };
+    for (int i = 0; i < tx.Length; i++) p.Add(new XShot("sweep", "wifi-power", txn[i]).S("tx_power", tx[i]));
+    foreach (int v in new[] { 10, 16, 20, 24 }) p.Add(new XShot("sweep", "clock", v + "MHz").S("xclk", v));
+    return p;
+  }
+  public static List<XShot> QuickWifiPlan(List<int[]> sizes) {
+    var p = new List<XShot>();
+    p.Add(new XShot("sweep", "res-quality", sizes[10][0] + "x" + sizes[10][1] + "_q10").S("framesize", 10).S("quality", 10));
+    p.Add(new XShot("sweep", "res-quality", sizes[13][0] + "x" + sizes[13][1] + "_q10").S("framesize", 13).S("quality", 10));
+    p.Add(new XShot("sweep", "wifi-power", "02dBm").S("tx_power", 8));
+    p.Add(new XShot("sweep", "wifi-power", "21dBm").S("tx_power", 84));
+    return p;
+  }  // winners of the sweep, mixed: per profile, top 4 groups by score spread x top 2 values
+  public static List<XShot> MixPlan(List<XShot> shots, List<XScores> scores, int groupsPer, int valuesPer, string[] profiles) {
     var outp = new List<XShot>(); var seen = new HashSet<string>();
-    foreach (string prof in XScore.Profiles) {
+    foreach (string prof in profiles) {
       double[] r = XScore.Rank(scores, prof);
       var byGroup = new Dictionary<string, List<int>>();
       for (int i = 0; i < shots.Count; i++) {
@@ -261,17 +292,33 @@ public class XCrazy {
   }
 
   // ---------- run ----------
+  public string Mode = "usb";          // "usb" or "wifi"
+  public volatile string WifiStatus = "";
+  public double ClipSec = 5;
+  Dictionary<string, int> roundOver = new Dictionary<string, int>();
+  XWifi wifi;
+
   public void Start() {
     if (running) return;
     if (string.IsNullOrEmpty(OutDir)) throw new Exception("choose an output folder first");
-    if (ReadBoard() == null) throw new Exception("camera not connected (or old firmware - flash with option 1)");
-    if (!hub.IsLive) throw new Exception("no picture coming from the camera");
+    if (ReadBoard() == null) throw new Exception("camera not connected over USB (or old firmware - flash with option 1)");
+    if (Mode == "usb" && !hub.IsLive) throw new Exception("no picture coming from the camera");
+    if (Mode == "wifi") { string u = StreamUrl(); if (!XWifi.Reachable(u, 2500)) throw new Exception("cannot reach the camera WiFi video at " + u + " - connect this PC to the XIAO-CAM WiFi first"); }
     Directory.CreateDirectory(OutDir);
     Err = ""; RoundsDone = 0; running = true; Phase = "starting";
     th = new Thread(Loop); th.IsBackground = true; th.Start();
   }
   public void Stop() { running = false; }
   public void StopAndWait(int ms) { running = false; Thread t = th; if (t != null) t.Join(ms); }
+
+  public string StreamUrl() {
+    try {
+      var d = Js().DeserializeObject(hub.BoardJson) as Dictionary<string, object>;
+      if (d != null && d.ContainsKey("stream_url")) return Convert.ToString(d["stream_url"]);
+      string ip = d != null && d.ContainsKey("ap_ip") ? Convert.ToString(d["ap_ip"]) : "";
+      return "http://" + (ip.Length > 0 ? ip : "192.168.4.1") + ":81/stream";
+    } catch { return "http://192.168.4.1:81/stream"; }
+  }
 
   Dictionary<string, int> ReadBoard() {
     string j = hub.BoardJson;
@@ -309,6 +356,8 @@ public class XCrazy {
     } catch (Exception e) { Err = e.Message; hub.OnMsg("crazy mode stopped: " + e.Message); }
     finally {
       Phase = "restoring your settings";
+      StopWifi();
+      roundOver.Clear();
       try { Apply(new Dictionary<string, int>(), false); } catch { }
       running = false;
       hub.Cmd("set autosave 1");
@@ -316,9 +365,10 @@ public class XCrazy {
     }
   }
 
-  // send only what differs from what the camera has now; base + overrides
+  // send only what differs from what the camera has now; base + round overrides + shot overrides
   bool Apply(Dictionary<string, int> over, bool forceAll) {
     var full = new Dictionary<string, int>(baseSet);
+    foreach (var kv in roundOver) full[kv.Key] = kv.Value;
     foreach (var kv in over) full[kv.Key] = kv.Value;
     bool resChange = false;
     foreach (string k in Keys) {
@@ -337,62 +387,79 @@ public class XCrazy {
     return fs >= 0 && fs < sizes.Count ? sizes[fs] : null;
   }
 
-  // one shot: apply, settle, measure fps, grab a matching frame
-  byte[] Take(Dictionary<string, int> over, out double fps) {
+  void StartWifi() {
+    StopWifi();
+    hub.ResetClock();
+    for (int i = 0; i < 8; i++) { hub.Cmd("ping " + ((long)XHub.NowMs).ToString()); Wait(60); }
+    wifi = new XWifi(hub, StreamUrl()); wifi.Start();
+  }
+  void StopWifi() { XWifi w = wifi; wifi = null; if (w != null) w.Stop(); }
+
+  // one clip: apply, settle, record ClipSec seconds of what arrives (USB or WiFi)
+  XClip Capture(Dictionary<string, int> over, double seconds) {
     for (int attempt = 0; ; attempt++) {
-      while (!hub.IsLive) { Phase = "waiting for the camera (unplugged?)"; Wait(500); }
-      Phase = "shooting";
+      int waited = 0;
+      while (!hub.IsLive) {
+        Phase = Mode == "wifi" ? "waiting for WiFi video" + (wifi != null && wifi.Status.Length > 0 ? " (" + wifi.Status + ")" : "") : "waiting for the camera (unplugged?)";
+        Wait(500); waited += 500;
+        if (Mode == "wifi" && waited % 10000 == 0) StartWifi();
+      }
+      Phase = "recording";
       bool big = Apply(over, attempt > 0);
       Wait(Quick ? 400 : (1200 + (big ? 1500 : 0)));
-      long f0 = hub.TotalFrames; var t0 = DateTime.Now;
-      Wait(Quick ? 500 : 1500);
-      fps = (hub.TotalFrames - f0) / (DateTime.Now - t0).TotalSeconds;
-      int[] want = Expect(over);
-      var deadline = DateTime.Now.AddSeconds(5);
-      byte[] last = null;
-      while (DateTime.Now < deadline) {
-        DateTime at; int w, h;
-        byte[] f = hub.LatestWithTime(out at, out w, out h);
-        if (f != null && at > t0) {
-          last = f;
-          if (want == null || (w == want[0] && h == want[1])) return f;
-        }
-        Wait(60);
-      }
-      if (last != null) return last;          // camera ignored the size: keep what it sent
+      var clip = new XClip(Expect(over));
+      hub.Tap = clip.Add;
+      try { Wait((int)(seconds * 1000)); } finally { hub.Tap = null; }
+      clip.Done(seconds);
+      if (clip.Count > 0) return clip;
       if (attempt >= 2) throw new Exception("no pictures from the camera");
       cur.Clear();                           // after a reconnect, send everything again
     }
   }
 
+  void CheckDisk() {
+    try {
+      var di = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(OutDir)));
+      if (di.AvailableFreeSpace < 5L * 1024 * 1024 * 1024) throw new Exception("the disk is almost full (less than 5 GB free) - crazy mode stopped");
+    } catch (ArgumentException) { }
+  }
+
   void RunRound() {
     ReadBoard();
+    bool wf = Mode == "wifi";
     Round++; ShotN = 0;
-    // 1. light probe
-    Phase = "measuring the light"; Current = "light probe";
-    var probe = new Dictionary<string, int>(); probe["aec"] = 0; probe["aec_value"] = 300; probe["agc"] = 0; probe["agc_gain"] = 0;
-    double pf; byte[] pj = Take(probe, out pf);
-    byte[] pth; XScores ps = XScore.Compute(pj, out pth);
-    Light = ps.Mean > 0.35 ? "day" : ps.Mean > 0.10 ? "dim" : "night";
-    int num = NextRoundNumber();
-    RoundName = DateTime.Now.ToString("yyyy-MM-dd_HHmm") + "_R" + num.ToString("000") + "_" + Light;
-    string rdir = Path.Combine(OutDir, RoundName);
-    Directory.CreateDirectory(rdir);
-    var round = new Dictionary<string, object>();
-    round["round"] = num; round["name"] = RoundName; round["light"] = Light; round["lightMean"] = Math.Round(ps.Mean, 4);
-    round["started"] = DateTime.Now.ToString("s"); round["base"] = baseSet; round["sizes"] = sizes; round["maxSize"] = maxSize;
-    var shotList = new List<object>(); round["shots"] = shotList;
-    File.WriteAllBytes(Path.Combine(rdir, "0-light-probe.jpg"), pj);
+    roundOver.Clear();
+    if (wf) { roundOver["usb"] = 0; Apply(new Dictionary<string, int>(), false); StartWifi(); }
+    try {
+      Phase = "measuring the light"; Current = "light probe";
+      var probe = new Dictionary<string, int>(); probe["aec"] = 0; probe["aec_value"] = 300; probe["agc"] = 0; probe["agc_gain"] = 0;
+      XClip pc = Capture(probe, 1.0);
+      byte[] pth; XScores ps = XScore.Compute(pc.Middle, out pth);
+      Light = ps.Mean > 0.35 ? "day" : ps.Mean > 0.10 ? "dim" : "night";
+      int num = NextRoundNumber();
+      RoundName = DateTime.Now.ToString("yyyy-MM-dd_HHmm") + "_R" + num.ToString("000") + "_" + (wf ? "wifi_" : "") + Light;
+      string rdir = Path.Combine(OutDir, RoundName);
+      Directory.CreateDirectory(rdir);
+      var round = new Dictionary<string, object>();
+      round["round"] = num; round["name"] = RoundName; round["mode"] = Mode; round["light"] = Light; round["lightMean"] = Math.Round(ps.Mean, 4);
+      round["started"] = DateTime.Now.ToString("s"); round["base"] = baseSet; round["sizes"] = sizes; round["maxSize"] = maxSize;
+      round["clipSec"] = ClipSec;
+      if (wf) { round["streamUrl"] = StreamUrl(); round["pcWifi"] = XWifi.PcSignal(); round["clockRttMs"] = double.IsNaN(hub.ClockOffset) ? -1 : Math.Round(hub.ClockRtt, 1); }
+      var shotList = new List<object>(); round["shots"] = shotList;
+      File.WriteAllBytes(Path.Combine(rdir, "0-light-probe.jpg"), pc.Middle);
 
-    List<XShot> plan = Quick ? QuickPlan(maxSize, sizes) : SweepPlan(maxSize, sizes);
-    ShotTotal = plan.Count + (Quick ? 4 : 40);
-    var done = new List<XShot>(); var sc = new List<XScores>();
-    foreach (XShot s in plan) { XScores r = Shoot(s, rdir, round, shotList); if (r != null) { done.Add(s); sc.Add(r); } }
-    List<XShot> mix = MixPlan(done, sc, Quick ? 2 : 4, 2);
-    ShotTotal = ShotN + mix.Count;
-    foreach (XShot s in mix) Shoot(s, rdir, round, shotList);
-    round["finished"] = DateTime.Now.ToString("s");
-    WriteRound(rdir, round);
+      List<XShot> plan = wf ? (Quick ? QuickWifiPlan(sizes) : WifiPlan(maxSize, sizes)) : (Quick ? QuickPlan(maxSize, sizes) : SweepPlan(maxSize, sizes));
+      ShotTotal = plan.Count + (Quick ? 4 : 32);
+      var done = new List<XShot>(); var sc = new List<XScores>();
+      foreach (XShot s in plan) { XScores r = Shoot(s, rdir, round, shotList); if (r != null) { done.Add(s); sc.Add(r); } }
+      List<XShot> mix = MixPlan(done, sc, Quick ? 2 : (wf ? 3 : 4), 2, wf ? XScore.WifiProfiles : XScore.Profiles);
+      ShotTotal = ShotN + mix.Count;
+      foreach (XShot s in mix) Shoot(s, rdir, round, shotList);
+      round["finished"] = DateTime.Now.ToString("s");
+      WriteRound(rdir, round);
+    } finally {
+      if (wf) StopWifi();
+    }
   }
 
   int NextRoundNumber() {
@@ -407,29 +474,32 @@ public class XCrazy {
   static string Safe(string s) { return Regex.Replace(s, "[^A-Za-z0-9_+\\-.]", "_"); }
 
   XScores Shoot(XShot s, string rdir, Dictionary<string, object> round, List<object> shotList) {
+    CheckDisk();
     ShotN++; Current = s.Group + " = " + s.Label; ShotStarted = DateTime.Now;
-    double fps; byte[] jpg = Take(s.Set, out fps);
-    byte[] thumb; XScores r = XScore.Compute(jpg, out thumb); r.Fps = fps;
+    XClip clip = Capture(s.Set, Quick ? 1.5 : ClipSec);
+    byte[] thumb; XScores r = XScore.Compute(clip.Middle, out thumb);
+    clip.FillStats(r);
     string sub = s.Phase == "mix" ? "2-mix" : "1-sweep\\" + Safe(s.Group);
     string dir = Path.Combine(rdir, sub), tdir = Path.Combine(dir, "thumbs");
     Directory.CreateDirectory(tdir);
-    string name = Safe(s.Label) + ".jpg";
-    File.WriteAllBytes(Path.Combine(dir, name), jpg);
-    File.WriteAllBytes(Path.Combine(tdir, name), thumb);
+    string name = Safe(s.Label);
+    var index = clip.WriteAvi(Path.Combine(dir, name + ".avi"));
+    File.WriteAllText(Path.Combine(dir, name + ".json"), Js().Serialize(index));
+    File.WriteAllBytes(Path.Combine(tdir, name + ".jpg"), thumb);
     // what the camera really took
     var now = ReadBoard() ?? new Dictionary<string, int>();
-    var full = new Dictionary<string, int>(baseSet); foreach (var kv in s.Set) full[kv.Key] = kv.Value;
+    var full = new Dictionary<string, int>(baseSet); foreach (var kv in roundOver) full[kv.Key] = kv.Value; foreach (var kv in s.Set) full[kv.Key] = kv.Value;
     var notApplied = new List<string>();
     foreach (var kv in s.Set) { int v; if (now.TryGetValue(kv.Key, out v) && v != kv.Value) notApplied.Add(kv.Key); }
     string rel = RoundName + "/" + sub.Replace('\\', '/') + "/" + name;
     var d = new Dictionary<string, object>();
-    d["file"] = rel; d["thumb"] = RoundName + "/" + sub.Replace('\\', '/') + "/thumbs/" + name;
-    d["phase"] = s.Phase; d["group"] = s.Group; d["label"] = s.Label; d["changed"] = s.Set; d["set"] = full;
+    d["file"] = rel + ".avi"; d["index"] = rel + ".json"; d["thumb"] = RoundName + "/" + sub.Replace('\\', '/') + "/thumbs/" + name + ".jpg";
+    d["mode"] = Mode; d["phase"] = s.Phase; d["group"] = s.Group; d["label"] = s.Label; d["changed"] = s.Set; d["set"] = full;
     if (s.Mix != null) { d["mix"] = s.Mix; d["from"] = s.From; }
     d["notApplied"] = notApplied; d["scores"] = r.ToDict(); d["time"] = DateTime.Now.ToString("s");
     shotList.Add(d);
     WriteRound(rdir, round);
-    LastShot = rel; LastScoresJson = Js().Serialize(r.ToDict());
+    LastShot = d["thumb"].ToString(); LastScoresJson = Js().Serialize(r.ToDict());
     double took = (DateTime.Now - ShotStarted).TotalSeconds;
     AvgShotSec = AvgShotSec * 0.8 + took * 0.2;
     return r;
@@ -443,7 +513,6 @@ public class XCrazy {
       File.Move(tmp, p);
     }
   }
-
   // ---------- library for Compare ----------
   public string RoundsJson() {
     var list = new List<object>();
@@ -468,7 +537,8 @@ public class XCrazy {
     string full;
     try { full = Path.GetFullPath(Path.Combine(root, rel.Replace('/', '\\'))); } catch { return null; }
     if (!full.StartsWith(root, StringComparison.OrdinalIgnoreCase)) return null;
-    if (!full.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase)) return null;
+    string ext = Path.GetExtension(full).ToLowerInvariant();
+    if (ext != ".jpg" && ext != ".avi" && ext != ".json") return null;
     return File.Exists(full) ? full : null;
   }
   string StarsPath { get { return Path.Combine(OutDir, "stars.json"); } }
@@ -488,7 +558,8 @@ public class XCrazy {
     o["running"] = running; o["phase"] = Phase; o["current"] = Current; o["err"] = Err; o["dir"] = OutDir;
     o["round"] = RoundName; o["light"] = Light; o["shot"] = ShotN; o["total"] = ShotTotal; o["roundsDone"] = RoundsDone;
     o["eta"] = running ? Math.Round(Math.Max(0, ShotTotal - ShotN) * AvgShotSec) : 0;
-    o["last"] = LastShot;
+    o["last"] = LastShot; o["mode"] = Mode; o["streamUrl"] = StreamUrl();
+    XWifi w = wifi; o["wifi"] = w == null ? "" : w.Status;
     return Js().Serialize(o).TrimEnd('}') + ",\"scores\":" + LastScoresJson + "}";
   }
 }

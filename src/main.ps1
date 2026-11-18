@@ -26,8 +26,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$StudioVersion   = '2.2.0'      # bump on every release (Update button compares this)
-$FirmwareVersion = '2.1'        # bump when the sketch below changes (Studio then asks to flash)
+$StudioVersion   = '2.3.0'      # bump on every release (Update button compares this)
+$FirmwareVersion = '2.2'        # bump when the sketch below changes (Studio then asks to flash)
 $Ssid = 'XIAO-CAM'            # first-time hotspot name (change later in the Studio, WiFi tab)
 $Pass = 'xiaocam123'          # first-time hotspot password: at least 8 characters
 $StudioPort = 8787
