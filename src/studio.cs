@@ -38,6 +38,9 @@ public class XHub {
   readonly object fl = new object(), sl = new object(), rl = new object();
   byte[] frame; long seq; int fw, fh; DateTime frameAt;
   public XCrazy Crazy;
+  public XLink LinkMgr;
+  public XTest Test;
+  public string TestsDir = "";
   // monotonic PC clock (ms) + board clock offset (boardMs - pcMs) from USB pings
   static readonly Stopwatch clock = Stopwatch.StartNew();
   public static double NowMs { get { return clock.Elapsed.TotalMilliseconds; } }
@@ -55,7 +58,7 @@ public class XHub {
   public bool IsLive { get { return (DateTime.Now - LastFrameAt).TotalSeconds < 2; } }
   public long TotalFrames { get { return Interlocked.Read(ref totalFrames); } }
   public byte[] LatestWithTime(out DateTime at, out int w, out int h) { lock (fl) { at = frameAt; w = fw; h = fh; return frame; } }
-  int winFrames; long winBytes; double fps, kbps;
+  int winFrames; long winBytes; double fps, kbps, winLat; int winLatN; double latNow = -1;
   float peak; int peakN;
   long totalFrames;
   volatile bool shutdown;
@@ -63,7 +66,10 @@ public class XHub {
   public void StartAll(string crazyDefault) {
     Crazy = new XCrazy(this);
     Crazy.LoadDir(crazyDefault);
+    LinkMgr = new XLink(this);
+    Test = new XTest(this); Test.Dir = TestsDir.Length > 0 ? TestsDir : Path.Combine(Path.GetDirectoryName(crazyDefault), "link-tests");
     StartSource();
+    LinkMgr.Start();
     var t = new Thread(TickLoop); t.IsBackground = true; t.Start();
   }
   public void StartSource() {
@@ -77,19 +83,27 @@ public class XHub {
     int n = 0;
     while (!shutdown) {
       Thread.Sleep(1000); n++;
-      lock (sl) { fps = winFrames; kbps = winBytes * 8.0 / 1000.0; winFrames = 0; winBytes = 0; }
+      lock (sl) { fps = winFrames; kbps = winBytes * 8.0 / 1000.0; latNow = winLatN > 0 ? winLat / winLatN : -1; winFrames = 0; winBytes = 0; winLat = 0; winLatN = 0; }
       XAvi r = Rec;
       if (r != null && n % 2 == 0) { try { r.Tick(); } catch (Exception e) { LastMsg = "recording error: " + e.Message; } }
     }
   }
   public void OnFrame(byte[] jpg) { OnFrame(jpg, -1); }
+  // a frame from the USB cable (board capture time tsBoard, -1 = unknown); ignored while the link is WiFi
+  public void OnUsbFrame(byte[] jpg, double tsBoard) {
+    XLink lk = LinkMgr;
+    XCrazy cz = Crazy;
+    if (lk != null && lk.Mode == "wifi" && (cz == null || !cz.Running)) return;
+    double off = ClockOffset;
+    OnFrame(jpg, tsBoard >= 0 && !double.IsNaN(off) ? NowMs - (tsBoard - off) : -1);
+  }
   public void OnFrame(byte[] jpg, double latency) {
     int w, h;
     XJpeg.Size(jpg, out w, out h);
     DateTime now = DateTime.Now;
     lock (fl) { frame = jpg; seq++; fw = w; fh = h; frameAt = now; Monitor.PulseAll(fl); }
     LastFrameAt = now; Interlocked.Increment(ref totalFrames);
-    lock (sl) { winFrames++; winBytes += jpg.Length; }
+    lock (sl) { winFrames++; winBytes += jpg.Length; if (latency >= 0 && latency < 10000) { winLat += latency; winLatN++; } }
     FrameTap tap = Tap; if (tap != null) { try { tap(jpg, w, h, NowMs, latency); } catch { } }
     XAvi r = Rec;
     if (r != null) { try { r.AddVideo(jpg, w, h); } catch (Exception e) { LastMsg = "recording error: " + e.Message; StopRec(); } }
@@ -114,7 +128,15 @@ public class XHub {
       last = seq; return frame;
     }
   }
-  public bool Cmd(string line) { IXSource s = Source; return s != null && s.Send(line); }
+  public DateTime LastSetAt = DateTime.MinValue;   // camera settings changed (link test waits for the picture to settle)
+  public bool Cmd(string line) {
+    if (line.StartsWith("set ") && !line.StartsWith("set usb") && !line.StartsWith("set autosave")) LastSetAt = DateTime.Now;
+    IXSource s = Source;
+    if (s != null && s.Connected) return s.Send(line);
+    XLink lk = LinkMgr;
+    if (lk != null && lk.Mode == "wifi") return lk.SendWifi(line);   // board on a battery, reachable over WiFi
+    return s != null && s.Send(line);
+  }
 
   public string Snapshot() {
     byte[] f = Latest();
@@ -148,7 +170,9 @@ public class XHub {
   }
   public void Shutdown() {
     shutdown = true;
+    XTest ts = Test; if (ts != null) ts.Stop();
     XCrazy cz = Crazy; if (cz != null) cz.StopAndWait(8000);
+    XLink lk = LinkMgr; if (lk != null) lk.Stop();
     StopRec();
     IXSource s = Source; if (s != null) s.Stop();
   }
@@ -184,7 +208,7 @@ public class XHub {
     sb.Append(",\"status\":\"").Append(Esc(Status)).Append("\"");
     sb.Append(",\"msg\":\"").Append(Esc(LastMsg)).Append("\"");
     sb.Append(",\"sendErr\":\"").Append(Esc(conn ? SendErr : "")).Append("\"");
-    sb.Append(",\"fps\":").Append(N(f)).Append(",\"kbps\":").Append(N(k));
+    sb.Append(",\"fps\":").Append(N(f)).Append(",\"kbps\":").Append(N(k)).Append(",\"lat\":").Append(N(Math.Round(latNow)));
     sb.Append(",\"kb\":").Append(fr == null ? "0" : N(fr.Length / 1024.0));
     sb.Append(",\"w\":").Append(w).Append(",\"h\":").Append(h);
     sb.Append(",\"level\":").Append(N(Level));
@@ -204,6 +228,8 @@ public class XHub {
       sb.Append(",\"part\":").Append(r.Part).Append("}");
     } else sb.Append(",\"rec\":null");
     sb.Append("},\"crazy\":").Append(Crazy == null ? "null" : Crazy.StateJson());
+    sb.Append(",\"link\":").Append(LinkMgr == null ? "null" : LinkMgr.StateJson());
+    sb.Append(",\"test\":").Append(Test == null ? "null" : Test.StateJson());
     sb.Append(",\"board\":");
     string b = BoardJson;
     sb.Append(string.IsNullOrEmpty(b) ? "null" : b);
@@ -282,13 +308,14 @@ public class XSerial : IXSource {
       if (a[i] != 0x58) continue;
       byte b1 = a[i + 1], b2 = a[i + 2], b3 = a[i + 3];
       if ((b1 == 'C' && b2 == 'A' && b3 == 'M') || (b1 == 'A' && b2 == 'U' && b3 == 'D') ||
-          (b1 == 'C' && b2 == 'F' && b3 == 'G') || (b1 == 'M' && b2 == 'S' && b3 == 'G') || (b1 == 'P' && b2 == 'N' && b3 == 'G')) return i;
+          (b1 == 'C' && b2 == 'F' && b3 == 'G') || (b1 == 'M' && b2 == 'S' && b3 == 'G') || (b1 == 'P' && b2 == 'N' && b3 == 'G') ||
+          (b1 == 'T' && b2 == 'S' && b3 == 'P')) return i;
     }
     return -1;
   }
 
   void Loop() {
-    byte[] acc = new byte[8 << 20]; int len = 0; byte[] chunk = new byte[65536];
+    byte[] acc = new byte[8 << 20]; int len = 0; byte[] chunk = new byte[65536]; double ts = -1;
     while (running) {
       try {
         if (sp == null || !sp.IsOpen) {
@@ -313,7 +340,7 @@ public class XSerial : IXSource {
           if (len - m < 8) { pos = m; break; }
           int L = acc[m + 4] | (acc[m + 5] << 8) | (acc[m + 6] << 16) | (acc[m + 7] << 24);
           char k = (char)acc[m + 1]; char k2 = (char)acc[m + 2];
-          bool cam = k == 'C' && k2 == 'A', aud = k == 'A', cfg = k == 'C' && k2 == 'F', png = k == 'P';
+          bool cam = k == 'C' && k2 == 'A', aud = k == 'A', cfg = k == 'C' && k2 == 'F', png = k == 'P', tsp = k == 'T';
           int max = cam ? 3000000 : aud ? 65536 : cfg ? 16000 : 1000;
           int min = cam ? 100 : 1;
           if (L < min || L > max) { pos = m + 1; continue; }
@@ -322,7 +349,7 @@ public class XSerial : IXSource {
           if (cam) {
             if (acc[d] == 0xFF && acc[d + 1] == 0xD8) {
               var f = new byte[L]; Buffer.BlockCopy(acc, d, f, 0, L);
-              hub.OnFrame(f); hub.Status = "live";
+              hub.OnUsbFrame(f, ts); ts = -1; hub.Status = "live";
               pos = d + L;
             } else pos = m + 1;
           } else if (aud) { hub.OnAudio(acc, d, L); pos = d + L; }
@@ -331,6 +358,7 @@ public class XSerial : IXSource {
             if (j.StartsWith("{") && j.EndsWith("}")) { hub.OnCfg(j); if (hub.Status != "live") hub.Status = "connected"; pos = d + L; }
             else pos = m + 1;
           } else if (png) { hub.OnPong(Encoding.ASCII.GetString(acc, d, L)); pos = d + L; }
+          else if (tsp) { if (!double.TryParse(Encoding.ASCII.GetString(acc, d, L), out ts)) ts = -1; pos = d + L; }
           else { hub.OnMsg("camera says: " + Encoding.ASCII.GetString(acc, d, L)); pos = d + L; }
         }
         if (pos > 0) { Buffer.BlockCopy(acc, pos, acc, 0, len - pos); len -= pos; }
@@ -475,7 +503,7 @@ public class XDemo : IXSource {
         try {
           byte[] fr = Render(t, jpg); fpsN++;
           lock (wlk) { wFrame = fr; wTs = XHub.NowMs + BoardOffset - 30; wSeq++; Monitor.PulseAll(wlk); }
-          if (Get("usb") == 1) hub.OnFrame(fr);
+          if (Get("usb") == 1) hub.OnUsbFrame(fr, XHub.NowMs + BoardOffset - 15);
         } catch (Exception e) { hub.OnMsg("demo: " + e.Message); }
       }
       Thread.Sleep(4);
@@ -809,7 +837,43 @@ public class XWeb {
         else { Json(ns, Ok(false, null)); return; }
         hub.StartSource(); Json(ns, Ok(true, null)); return;
       }
+      case "/api/link": hub.LinkMgr.SetMode(G(q, "m")); Json(ns, Ok(true, null)); return;
+      case "/api/link/host": {
+        string h = G(q, "h").Trim();
+        if (h.Length > 0 && !Regex.IsMatch(h, "^[A-Za-z0-9.-]{1,64}(:[0-9]{1,5})?$")) { Json(ns, Ok(false, "\"err\":\"type an address like 192.168.4.1\"")); return; }
+        hub.LinkMgr.SetHost(h); Json(ns, Ok(true, null)); return;
+      }
+      case "/api/test/start":
+        try { hub.Test.Start(D(q, "sec", 30), G(q, "ant"), G(q, "note")); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/test/stop": hub.Test.Stop(); Json(ns, Ok(true, null)); return;
+      case "/api/test/list": Json(ns, hub.Test.ListJson()); return;
+      case "/api/test/delete":
+        try { hub.Test.Delete(G(q, "id")); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/test/note":
+        try { hub.Test.Rename(G(q, "id"), G(q, "note")); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/test/open": {
+        string f = G(q, "id") == "" ? null : hub.Test.FileFor(G(q, "id"), ".avi");
+        try {
+          if (G(q, "id") == "") { Directory.CreateDirectory(hub.Test.Dir); Process.Start("explorer.exe", "\"" + hub.Test.Dir + "\""); }
+          else if (f == null) throw new Exception("video not found");
+          else Process.Start(f);
+          Json(ns, Ok(true, null));
+        } catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      }
+      case "/test/thumb": {
+        string f = hub.Test.FileFor(G(q, "id"), ".jpg");
+        if (f == null) Send(ns, "404 Not Found", "text/plain", Encoding.ASCII.GetBytes("no")); else Send(ns, "200 OK", "image/jpeg", File.ReadAllBytes(f));
+        return;
+      }
       case "/api/crazy/start":
+        if (hub.Test.Running) { Json(ns, Ok(false, "\"err\":\"a link test is running\"")); return; }
         try { hub.Crazy.Mode = G(q, "mode") == "wifi" ? "wifi" : "usb"; hub.Crazy.Quick = G(q, "quick") == "1"; hub.Crazy.MaxRounds = (int)D(q, "rounds", 0); hub.Crazy.Start(); Json(ns, Ok(true, null)); }
         catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
         return;

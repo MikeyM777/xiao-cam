@@ -26,8 +26,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$StudioVersion   = '2.3.1'      # bump on every release (Update button compares this)
-$FirmwareVersion = '2.2'        # bump when the sketch below changes (Studio then asks to flash)
+$StudioVersion   = '2.4.0'      # bump on every release (Update button compares this)
+$FirmwareVersion = '2.3'        # bump when the sketch below changes (Studio then asks to flash)
 $Ssid = 'XIAO-CAM'            # first-time hotspot name (change later in the Studio, WiFi tab)
 $Pass = 'xiaocam123'          # first-time hotspot password: at least 8 characters
 $StudioPort = 8787
@@ -174,6 +174,7 @@ function Start-Studio([bool]$demo) {
   $hub.Version = $StudioVersion; $hub.FwExpected = $FirmwareVersion; $hub.SelfPath = $env:XCAM_SELF
   $hub.PicturesDir = Join-Path $Root 'pictures'
   $hub.VideosDir = Join-Path $Root 'videos'
+  $hub.TestsDir = Join-Path $Root 'link-tests'
   $hub.Demo = $demo
   [XHub]::HookConsole($hub)
   $hub.StartAll((Join-Path $Root 'crazy'))

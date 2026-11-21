@@ -345,8 +345,8 @@ function updBoard(){if(!B){$('#bInfo').innerHTML='<span>Status</span><b>not conn
 // ---------- viewer: fit, zoom, pan, rotate ----------
 const V={rot:0,mir:false,z:1,x:0,y:0,grid:false,cross:false,pause:false};
 const img=$('#v'),box=$('#box'),stage=$('#stage');
-function startStream(){img.src='/stream?'+Date.now()}
-img.onload=layout;img.onerror=()=>setTimeout(startStream,1500);
+function startStream(){if(document.body.classList.contains('adv'))img.src='/stream?'+Date.now()}
+img.onload=layout;img.onerror=()=>{if(img.getAttribute('src'))setTimeout(startStream,1500)};
 function layout(){const w=img.naturalWidth||(P&&P.w)||4,h=img.naturalHeight||(P&&P.h)||3;const sw=stage.clientWidth,sh=stage.clientHeight;const rot=V.rot%180!==0;
   const s=Math.min(sw/(rot?h:w),sh/(rot?w:h));box.style.width=w*s+'px';box.style.height=h*s+'px';
   box.style.transform=`translate(-50%,-50%) translate(${V.x}px,${V.y}px) scale(${V.z}) rotate(${V.rot}deg) scaleX(${V.mir?-1:1})`;
@@ -373,7 +373,7 @@ addEventListener('keydown',e=>{if(e.target.matches('input,select,textarea')||doc
 // ---------- focus helper + histogram (from /frame.jpg) ----------
 const cv=document.createElement('canvas'),cx=cv.getContext('2d',{willReadFrequently:true});let fPeak=0,busy=false;
 $('#focReset').onclick=()=>{fPeak=0};
-async function analyse(){if(busy||!P||!P.live||document.hidden)return;busy=true;
+async function analyse(){if(busy||!P||!P.live||document.hidden||!document.body.classList.contains('adv'))return;busy=true;
   try{const bl=await (await fetch('/frame.jpg',{cache:'no-store'})).blob();const bm=await createImageBitmap(bl);
     const W=240,H=Math.round(W*bm.height/bm.width);cv.width=W;cv.height=H;cx.drawImage(bm,0,0,W,H);
     const d=cx.getImageData(0,0,W,H).data;const hist=new Array(256).fill(0);const g=new Float32Array(W*H);
@@ -414,7 +414,7 @@ async function poll(){const s=await api('/api/state');if(s&&s.pc){if(poll.down){
     const g=$('#recGo');g.classList.toggle('on',!!r);g.textContent=r?'Stop recording':'Start recording';
     $('#recInfo').innerHTML=r?[['File',r.file],['Time',mmss(r.secs)],['Frames',r.frames],['Size',r.mb.toFixed(1)+' MB'],['Frame rate',r.tl?'1 every '+r.tl+' s':r.fps+' fps'],['Sound',r.audio?'yes':'no']].map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join(''):`<span>Folder</span><b title="${P.videos}">${P.videos}</b>`;
     const micOn=B&&B.mic;$('#micState').textContent=micOn?'on':'off';$('#vu').style.width=micOn?Math.min(100,P.level*130)+'%':'0';$('#micHint').textContent=micOn?'Level from the board microphone.':'Turn the mic on in the Record tab.';
-    updCrazy(s.crazy);
+    updCrazy(s.crazy);if(typeof sUpd==='function')sUpd(s);
     if(P.msg&&P.msg!==poll.msg){if(poll.msg!==undefined)toast(P.msg);poll.msg=P.msg}}
   refresh()}
 TABS.forEach(([id,label,items],i)=>{
@@ -431,4 +431,6 @@ setInterval(poll,500);poll();
 $('#snapTop').onclick=snap;$('#recBtnTop').onclick=toggleRec;
 $('#quitTop').onclick=async()=>{if(!$('#quitTop').dataset.arm){$('#quitTop').dataset.arm=1;$('#quitTop').textContent='Click to confirm';setTimeout(()=>{delete $('#quitTop').dataset.arm;$('#quitTop').textContent='Quit'},3000);return}
   await api('/api/quit');document.body.innerHTML='<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#8b94a1">Studio stopped. You can close this tab.</div>'};
-</script></body></html>
+</script>
+<!--SIMPLE-->
+</body></html>

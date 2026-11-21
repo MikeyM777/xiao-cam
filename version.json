@@ -1,5 +1,5 @@
 {
-    "notes":  "Fix: when the camera runs old firmware the Studio now says so (instead of \"not connected\") and shows a Flash firmware now button at the top. Crazy mode and settings need the new firmware 2.2.",
-    "firmware":  "2.2",
-    "studio":  "2.3.1"
+    "notes":  "New simple Link test screen: send video over USB cable or WiFi (with / without antenna), press Start test, see fps, arrived %, freezes, delay, signal and data side by side. The old studio is under Advanced settings. Firmware 2.3 (flash once): delay over USB, WiFi signal in hotspot mode.",
+    "firmware":  "2.3",
+    "studio":  "2.4.0"
 }

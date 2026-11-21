@@ -1,7 +1,7 @@
 # Headless test of crazy mode (USB + WiFi) on the demo camera. Run:  powershell -NoProfile -File tests\test-crazy.ps1
 $ErrorActionPreference = 'Stop'
 $src = Join-Path (Split-Path -Parent $PSScriptRoot) 'src'
-$cs = (@('studio.cs', 'crazy.cs', 'wifi.cs', 'update.cs') | ForEach-Object { [IO.File]::ReadAllText("$src\$_") }) -join "`n"
+$cs = (@('studio.cs', 'crazy.cs', 'wifi.cs', 'link.cs', 'update.cs') | ForEach-Object { [IO.File]::ReadAllText("$src\$_") }) -join "`n"
 Add-Type -TypeDefinition $cs -ReferencedAssemblies System.Drawing, System.Management, System.Web.Extensions, System.Windows.Forms, System.Net
 $fail = 0
 function Check($name, $ok) { if ($ok) { Write-Host "PASS $name" -ForegroundColor Green } else { Write-Host "FAIL $name" -ForegroundColor Red; $script:fail++ } }

@@ -1,14 +1,16 @@
 // XIAO-CAM firmware v2 - Seeed XIAO ESP32S3 Sense
 // USB-C packets to PC: 4-byte magic + uint32 LE length + data
+//   XTSP = capture time (board ms, text) of the next XCAM   XPNG = ping reply
 //   XCAM = JPEG frame   XAUD = PCM16 mono 16 kHz   XCFG = JSON settings+status   XMSG = text
 // USB-C commands from PC (text lines):
 //   get | set <key> <int> | str <key> <text> | wifi_apply | save | defaults | reboot
-// WiFi page: http://<board ip>/   stream :81/stream   /capture   /status
+// WiFi page: http://<board ip>/   stream :81/stream   /capture   /status   /cmd?c=<command> (same as USB)
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include <ESP_I2S.h>
 #include "esp_http_server.h"
+#include "esp_wifi.h"
 
 #define FW_VERSION "@@FWVER@@"
 #define LED_PIN 21
@@ -35,6 +37,7 @@ static int usbFrames = 0;
 static bool dirty = false, cfgNow = true, webStarted = false, autosave = true;
 static uint32_t dirtyAt = 0;
 static volatile bool micRunning = false, micBusy = false;
+static char webCmd[200]; static volatile bool webCmdNew = false;   // command from WiFi, run by loop()
 
 // ---------- sensor settings table ----------
 typedef int (*SetFn)(sensor_t*, int);
@@ -268,6 +271,12 @@ static String cfgJson() {
   jStr(j, "sta_ip", sta ? WiFi.localIP().toString() : String(""));
   jInt(j, "rssi", sta ? WiFi.RSSI() : 0);
   jInt(j, "ap_clients", (wifiMode & 1) ? WiFi.softAPgetStationNum() : 0);
+  int apRssi = 0;
+  if (wifiMode & 1) {
+    wifi_sta_list_t sl;
+    if (esp_wifi_ap_get_sta_list(&sl) == ESP_OK) for (int i = 0; i < sl.num; i++) if (!apRssi || sl.sta[i].rssi > apRssi) apRssi = sl.sta[i].rssi;
+  }
+  jInt(j, "ap_rssi", apRssi);
   jInt(j, "stream_clients", streamClients);
   jNum(j, "cap_fps", capFps); jNum(j, "usb_fps", usbFps); jNum(j, "temp", temperatureRead());
   jInt(j, "heap", ESP.getFreeHeap()); jInt(j, "psram", ESP.getFreePsram()); jInt(j, "uptime", millis() / 1000);
@@ -303,6 +312,34 @@ static esp_err_t captureHandler(httpd_req_t* r) {
   return e;
 }
 
+static esp_err_t cmdHandler(httpd_req_t* r) {
+  char q[220], c[200];
+  bool ok = httpd_req_get_url_query_str(r, q, sizeof q) == ESP_OK && httpd_query_key_value(q, "c", c, sizeof c) == ESP_OK;
+  if (ok) {   // url-decode (+ and %xx)
+    char* o = c;
+    for (char* i = c; *i; i++, o++) {
+      if (*i == '+') *o = ' ';
+      else if (*i == '%' && isxdigit((unsigned char)i[1]) && isxdigit((unsigned char)i[2])) { char h[3] = { i[1], i[2], 0 }; *o = (char)strtol(h, nullptr, 16); i += 2; }
+      else *o = *i;
+    }
+    *o = 0;
+    for (int w = 0; webCmdNew && w < 100; w++) vTaskDelay(pdMS_TO_TICKS(5));
+    strncpy(webCmd, c, sizeof webCmd - 1); webCmd[sizeof webCmd - 1] = 0; webCmdNew = true;
+  }
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_sendstr(r, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+// clock sync over WiFi (board not on USB): /ping?t=<pc ms> -> "<pc ms> <board millis>"
+static esp_err_t pingHandler(httpd_req_t* r) {
+  char q[64], t[24] = "0", o[48];
+  if (httpd_req_get_url_query_str(r, q, sizeof q) == ESP_OK) httpd_query_key_value(q, "t", t, sizeof t);
+  snprintf(o, sizeof o, "%s %lu", t, (unsigned long)millis());
+  httpd_resp_set_type(r, "text/plain");
+  return httpd_resp_sendstr(r, o);
+}
+
 #define BOUNDARY "xcamframe"
 static esp_err_t streamHandler(httpd_req_t* r) {
   httpd_resp_set_type(r, "multipart/x-mixed-replace;boundary=" BOUNDARY);
@@ -330,8 +367,11 @@ static void startWeb() {
   httpd_uri_t p = { "/", HTTP_GET, pageHandler, nullptr };
   httpd_uri_t st = { "/status", HTTP_GET, statusHandler, nullptr };
   httpd_uri_t cp = { "/capture", HTTP_GET, captureHandler, nullptr };
+  httpd_uri_t cm = { "/cmd", HTTP_GET, cmdHandler, nullptr };
+  httpd_uri_t pg = { "/ping", HTTP_GET, pingHandler, nullptr };
   if (httpd_start(&page, &cfg) == ESP_OK) {
     httpd_register_uri_handler(page, &p); httpd_register_uri_handler(page, &st); httpd_register_uri_handler(page, &cp);
+    httpd_register_uri_handler(page, &cm); httpd_register_uri_handler(page, &pg);
   }
   cfg.server_port = 81; cfg.ctrl_port += 1;
   httpd_uri_t s = { "/stream", HTTP_GET, streamHandler, nullptr };
@@ -447,6 +487,7 @@ void setup() {
 
 void loop() {
   handleSerial();
+  if (webCmdNew) { char c[200]; strcpy(c, webCmd); webCmdNew = false; runCmd(c); }
   uint32_t now = millis();
   static uint32_t lastStat = 0;
   if (now - lastStat >= 1000) {
@@ -461,8 +502,13 @@ void loop() {
   if (micRunning) sendAudio();
   static uint8_t* buf = nullptr; static size_t cap = 0; static uint32_t seen = 0;
   if (camOk && usbOn) {
-    size_t n = copyLatest(buf, cap, seen);
-    if (n) { sendPacket("XCAM", buf, n); usbFrames++; return; }
+    uint32_t ts = 0;
+    size_t n = copyLatestTs(buf, cap, seen, &ts);
+    if (n) {
+      char t[12]; int tl = snprintf(t, sizeof t, "%lu", (unsigned long)ts);
+      sendPacket("XTSP", (const uint8_t*)t, tl);   // older studios skip this packet
+      sendPacket("XCAM", buf, n); usbFrames++; return;
+    }
   }
   delay(2);
 }

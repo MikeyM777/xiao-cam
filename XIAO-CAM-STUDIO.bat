@@ -26,8 +26,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-$StudioVersion   = '2.3.1'      # bump on every release (Update button compares this)
-$FirmwareVersion = '2.2'        # bump when the sketch below changes (Studio then asks to flash)
+$StudioVersion   = '2.4.0'      # bump on every release (Update button compares this)
+$FirmwareVersion = '2.3'        # bump when the sketch below changes (Studio then asks to flash)
 $Ssid = 'XIAO-CAM'            # first-time hotspot name (change later in the Studio, WiFi tab)
 $Pass = 'xiaocam123'          # first-time hotspot password: at least 8 characters
 $StudioPort = 8787
@@ -56,15 +56,17 @@ function Run-Arduino { & $Cli @args; if ($LASTEXITCODE -ne 0) { throw "arduino-c
 $Sketch = @'
 // XIAO-CAM firmware v2 - Seeed XIAO ESP32S3 Sense
 // USB-C packets to PC: 4-byte magic + uint32 LE length + data
+//   XTSP = capture time (board ms, text) of the next XCAM   XPNG = ping reply
 //   XCAM = JPEG frame   XAUD = PCM16 mono 16 kHz   XCFG = JSON settings+status   XMSG = text
 // USB-C commands from PC (text lines):
 //   get | set <key> <int> | str <key> <text> | wifi_apply | save | defaults | reboot
-// WiFi page: http://<board ip>/   stream :81/stream   /capture   /status
+// WiFi page: http://<board ip>/   stream :81/stream   /capture   /status   /cmd?c=<command> (same as USB)
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include <ESP_I2S.h>
 #include "esp_http_server.h"
+#include "esp_wifi.h"
 
 #define FW_VERSION "@@FWVER@@"
 #define LED_PIN 21
@@ -91,6 +93,7 @@ static int usbFrames = 0;
 static bool dirty = false, cfgNow = true, webStarted = false, autosave = true;
 static uint32_t dirtyAt = 0;
 static volatile bool micRunning = false, micBusy = false;
+static char webCmd[200]; static volatile bool webCmdNew = false;   // command from WiFi, run by loop()
 
 // ---------- sensor settings table ----------
 typedef int (*SetFn)(sensor_t*, int);
@@ -324,6 +327,12 @@ static String cfgJson() {
   jStr(j, "sta_ip", sta ? WiFi.localIP().toString() : String(""));
   jInt(j, "rssi", sta ? WiFi.RSSI() : 0);
   jInt(j, "ap_clients", (wifiMode & 1) ? WiFi.softAPgetStationNum() : 0);
+  int apRssi = 0;
+  if (wifiMode & 1) {
+    wifi_sta_list_t sl;
+    if (esp_wifi_ap_get_sta_list(&sl) == ESP_OK) for (int i = 0; i < sl.num; i++) if (!apRssi || sl.sta[i].rssi > apRssi) apRssi = sl.sta[i].rssi;
+  }
+  jInt(j, "ap_rssi", apRssi);
   jInt(j, "stream_clients", streamClients);
   jNum(j, "cap_fps", capFps); jNum(j, "usb_fps", usbFps); jNum(j, "temp", temperatureRead());
   jInt(j, "heap", ESP.getFreeHeap()); jInt(j, "psram", ESP.getFreePsram()); jInt(j, "uptime", millis() / 1000);
@@ -359,6 +368,34 @@ static esp_err_t captureHandler(httpd_req_t* r) {
   return e;
 }
 
+static esp_err_t cmdHandler(httpd_req_t* r) {
+  char q[220], c[200];
+  bool ok = httpd_req_get_url_query_str(r, q, sizeof q) == ESP_OK && httpd_query_key_value(q, "c", c, sizeof c) == ESP_OK;
+  if (ok) {   // url-decode (+ and %xx)
+    char* o = c;
+    for (char* i = c; *i; i++, o++) {
+      if (*i == '+') *o = ' ';
+      else if (*i == '%' && isxdigit((unsigned char)i[1]) && isxdigit((unsigned char)i[2])) { char h[3] = { i[1], i[2], 0 }; *o = (char)strtol(h, nullptr, 16); i += 2; }
+      else *o = *i;
+    }
+    *o = 0;
+    for (int w = 0; webCmdNew && w < 100; w++) vTaskDelay(pdMS_TO_TICKS(5));
+    strncpy(webCmd, c, sizeof webCmd - 1); webCmd[sizeof webCmd - 1] = 0; webCmdNew = true;
+  }
+  httpd_resp_set_type(r, "application/json");
+  httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_sendstr(r, ok ? "{\"ok\":true}" : "{\"ok\":false}");
+}
+
+// clock sync over WiFi (board not on USB): /ping?t=<pc ms> -> "<pc ms> <board millis>"
+static esp_err_t pingHandler(httpd_req_t* r) {
+  char q[64], t[24] = "0", o[48];
+  if (httpd_req_get_url_query_str(r, q, sizeof q) == ESP_OK) httpd_query_key_value(q, "t", t, sizeof t);
+  snprintf(o, sizeof o, "%s %lu", t, (unsigned long)millis());
+  httpd_resp_set_type(r, "text/plain");
+  return httpd_resp_sendstr(r, o);
+}
+
 #define BOUNDARY "xcamframe"
 static esp_err_t streamHandler(httpd_req_t* r) {
   httpd_resp_set_type(r, "multipart/x-mixed-replace;boundary=" BOUNDARY);
@@ -386,8 +423,11 @@ static void startWeb() {
   httpd_uri_t p = { "/", HTTP_GET, pageHandler, nullptr };
   httpd_uri_t st = { "/status", HTTP_GET, statusHandler, nullptr };
   httpd_uri_t cp = { "/capture", HTTP_GET, captureHandler, nullptr };
+  httpd_uri_t cm = { "/cmd", HTTP_GET, cmdHandler, nullptr };
+  httpd_uri_t pg = { "/ping", HTTP_GET, pingHandler, nullptr };
   if (httpd_start(&page, &cfg) == ESP_OK) {
     httpd_register_uri_handler(page, &p); httpd_register_uri_handler(page, &st); httpd_register_uri_handler(page, &cp);
+    httpd_register_uri_handler(page, &cm); httpd_register_uri_handler(page, &pg);
   }
   cfg.server_port = 81; cfg.ctrl_port += 1;
   httpd_uri_t s = { "/stream", HTTP_GET, streamHandler, nullptr };
@@ -503,6 +543,7 @@ void setup() {
 
 void loop() {
   handleSerial();
+  if (webCmdNew) { char c[200]; strcpy(c, webCmd); webCmdNew = false; runCmd(c); }
   uint32_t now = millis();
   static uint32_t lastStat = 0;
   if (now - lastStat >= 1000) {
@@ -517,8 +558,13 @@ void loop() {
   if (micRunning) sendAudio();
   static uint8_t* buf = nullptr; static size_t cap = 0; static uint32_t seen = 0;
   if (camOk && usbOn) {
-    size_t n = copyLatest(buf, cap, seen);
-    if (n) { sendPacket("XCAM", buf, n); usbFrames++; return; }
+    uint32_t ts = 0;
+    size_t n = copyLatestTs(buf, cap, seen, &ts);
+    if (n) {
+      char t[12]; int tl = snprintf(t, sizeof t, "%lu", (unsigned long)ts);
+      sendPacket("XTSP", (const uint8_t*)t, tl);   // older studios skip this packet
+      sendPacket("XCAM", buf, n); usbFrames++; return;
+    }
   }
   delay(2);
 }
@@ -568,6 +614,9 @@ public class XHub {
   readonly object fl = new object(), sl = new object(), rl = new object();
   byte[] frame; long seq; int fw, fh; DateTime frameAt;
   public XCrazy Crazy;
+  public XLink LinkMgr;
+  public XTest Test;
+  public string TestsDir = "";
   // monotonic PC clock (ms) + board clock offset (boardMs - pcMs) from USB pings
   static readonly Stopwatch clock = Stopwatch.StartNew();
   public static double NowMs { get { return clock.Elapsed.TotalMilliseconds; } }
@@ -585,7 +634,7 @@ public class XHub {
   public bool IsLive { get { return (DateTime.Now - LastFrameAt).TotalSeconds < 2; } }
   public long TotalFrames { get { return Interlocked.Read(ref totalFrames); } }
   public byte[] LatestWithTime(out DateTime at, out int w, out int h) { lock (fl) { at = frameAt; w = fw; h = fh; return frame; } }
-  int winFrames; long winBytes; double fps, kbps;
+  int winFrames; long winBytes; double fps, kbps, winLat; int winLatN; double latNow = -1;
   float peak; int peakN;
   long totalFrames;
   volatile bool shutdown;
@@ -593,7 +642,10 @@ public class XHub {
   public void StartAll(string crazyDefault) {
     Crazy = new XCrazy(this);
     Crazy.LoadDir(crazyDefault);
+    LinkMgr = new XLink(this);
+    Test = new XTest(this); Test.Dir = TestsDir.Length > 0 ? TestsDir : Path.Combine(Path.GetDirectoryName(crazyDefault), "link-tests");
     StartSource();
+    LinkMgr.Start();
     var t = new Thread(TickLoop); t.IsBackground = true; t.Start();
   }
   public void StartSource() {
@@ -607,19 +659,27 @@ public class XHub {
     int n = 0;
     while (!shutdown) {
       Thread.Sleep(1000); n++;
-      lock (sl) { fps = winFrames; kbps = winBytes * 8.0 / 1000.0; winFrames = 0; winBytes = 0; }
+      lock (sl) { fps = winFrames; kbps = winBytes * 8.0 / 1000.0; latNow = winLatN > 0 ? winLat / winLatN : -1; winFrames = 0; winBytes = 0; winLat = 0; winLatN = 0; }
       XAvi r = Rec;
       if (r != null && n % 2 == 0) { try { r.Tick(); } catch (Exception e) { LastMsg = "recording error: " + e.Message; } }
     }
   }
   public void OnFrame(byte[] jpg) { OnFrame(jpg, -1); }
+  // a frame from the USB cable (board capture time tsBoard, -1 = unknown); ignored while the link is WiFi
+  public void OnUsbFrame(byte[] jpg, double tsBoard) {
+    XLink lk = LinkMgr;
+    XCrazy cz = Crazy;
+    if (lk != null && lk.Mode == "wifi" && (cz == null || !cz.Running)) return;
+    double off = ClockOffset;
+    OnFrame(jpg, tsBoard >= 0 && !double.IsNaN(off) ? NowMs - (tsBoard - off) : -1);
+  }
   public void OnFrame(byte[] jpg, double latency) {
     int w, h;
     XJpeg.Size(jpg, out w, out h);
     DateTime now = DateTime.Now;
     lock (fl) { frame = jpg; seq++; fw = w; fh = h; frameAt = now; Monitor.PulseAll(fl); }
     LastFrameAt = now; Interlocked.Increment(ref totalFrames);
-    lock (sl) { winFrames++; winBytes += jpg.Length; }
+    lock (sl) { winFrames++; winBytes += jpg.Length; if (latency >= 0 && latency < 10000) { winLat += latency; winLatN++; } }
     FrameTap tap = Tap; if (tap != null) { try { tap(jpg, w, h, NowMs, latency); } catch { } }
     XAvi r = Rec;
     if (r != null) { try { r.AddVideo(jpg, w, h); } catch (Exception e) { LastMsg = "recording error: " + e.Message; StopRec(); } }
@@ -644,7 +704,15 @@ public class XHub {
       last = seq; return frame;
     }
   }
-  public bool Cmd(string line) { IXSource s = Source; return s != null && s.Send(line); }
+  public DateTime LastSetAt = DateTime.MinValue;   // camera settings changed (link test waits for the picture to settle)
+  public bool Cmd(string line) {
+    if (line.StartsWith("set ") && !line.StartsWith("set usb") && !line.StartsWith("set autosave")) LastSetAt = DateTime.Now;
+    IXSource s = Source;
+    if (s != null && s.Connected) return s.Send(line);
+    XLink lk = LinkMgr;
+    if (lk != null && lk.Mode == "wifi") return lk.SendWifi(line);   // board on a battery, reachable over WiFi
+    return s != null && s.Send(line);
+  }
 
   public string Snapshot() {
     byte[] f = Latest();
@@ -678,7 +746,9 @@ public class XHub {
   }
   public void Shutdown() {
     shutdown = true;
+    XTest ts = Test; if (ts != null) ts.Stop();
     XCrazy cz = Crazy; if (cz != null) cz.StopAndWait(8000);
+    XLink lk = LinkMgr; if (lk != null) lk.Stop();
     StopRec();
     IXSource s = Source; if (s != null) s.Stop();
   }
@@ -714,7 +784,7 @@ public class XHub {
     sb.Append(",\"status\":\"").Append(Esc(Status)).Append("\"");
     sb.Append(",\"msg\":\"").Append(Esc(LastMsg)).Append("\"");
     sb.Append(",\"sendErr\":\"").Append(Esc(conn ? SendErr : "")).Append("\"");
-    sb.Append(",\"fps\":").Append(N(f)).Append(",\"kbps\":").Append(N(k));
+    sb.Append(",\"fps\":").Append(N(f)).Append(",\"kbps\":").Append(N(k)).Append(",\"lat\":").Append(N(Math.Round(latNow)));
     sb.Append(",\"kb\":").Append(fr == null ? "0" : N(fr.Length / 1024.0));
     sb.Append(",\"w\":").Append(w).Append(",\"h\":").Append(h);
     sb.Append(",\"level\":").Append(N(Level));
@@ -734,6 +804,8 @@ public class XHub {
       sb.Append(",\"part\":").Append(r.Part).Append("}");
     } else sb.Append(",\"rec\":null");
     sb.Append("},\"crazy\":").Append(Crazy == null ? "null" : Crazy.StateJson());
+    sb.Append(",\"link\":").Append(LinkMgr == null ? "null" : LinkMgr.StateJson());
+    sb.Append(",\"test\":").Append(Test == null ? "null" : Test.StateJson());
     sb.Append(",\"board\":");
     string b = BoardJson;
     sb.Append(string.IsNullOrEmpty(b) ? "null" : b);
@@ -812,13 +884,14 @@ public class XSerial : IXSource {
       if (a[i] != 0x58) continue;
       byte b1 = a[i + 1], b2 = a[i + 2], b3 = a[i + 3];
       if ((b1 == 'C' && b2 == 'A' && b3 == 'M') || (b1 == 'A' && b2 == 'U' && b3 == 'D') ||
-          (b1 == 'C' && b2 == 'F' && b3 == 'G') || (b1 == 'M' && b2 == 'S' && b3 == 'G') || (b1 == 'P' && b2 == 'N' && b3 == 'G')) return i;
+          (b1 == 'C' && b2 == 'F' && b3 == 'G') || (b1 == 'M' && b2 == 'S' && b3 == 'G') || (b1 == 'P' && b2 == 'N' && b3 == 'G') ||
+          (b1 == 'T' && b2 == 'S' && b3 == 'P')) return i;
     }
     return -1;
   }
 
   void Loop() {
-    byte[] acc = new byte[8 << 20]; int len = 0; byte[] chunk = new byte[65536];
+    byte[] acc = new byte[8 << 20]; int len = 0; byte[] chunk = new byte[65536]; double ts = -1;
     while (running) {
       try {
         if (sp == null || !sp.IsOpen) {
@@ -843,7 +916,7 @@ public class XSerial : IXSource {
           if (len - m < 8) { pos = m; break; }
           int L = acc[m + 4] | (acc[m + 5] << 8) | (acc[m + 6] << 16) | (acc[m + 7] << 24);
           char k = (char)acc[m + 1]; char k2 = (char)acc[m + 2];
-          bool cam = k == 'C' && k2 == 'A', aud = k == 'A', cfg = k == 'C' && k2 == 'F', png = k == 'P';
+          bool cam = k == 'C' && k2 == 'A', aud = k == 'A', cfg = k == 'C' && k2 == 'F', png = k == 'P', tsp = k == 'T';
           int max = cam ? 3000000 : aud ? 65536 : cfg ? 16000 : 1000;
           int min = cam ? 100 : 1;
           if (L < min || L > max) { pos = m + 1; continue; }
@@ -852,7 +925,7 @@ public class XSerial : IXSource {
           if (cam) {
             if (acc[d] == 0xFF && acc[d + 1] == 0xD8) {
               var f = new byte[L]; Buffer.BlockCopy(acc, d, f, 0, L);
-              hub.OnFrame(f); hub.Status = "live";
+              hub.OnUsbFrame(f, ts); ts = -1; hub.Status = "live";
               pos = d + L;
             } else pos = m + 1;
           } else if (aud) { hub.OnAudio(acc, d, L); pos = d + L; }
@@ -861,6 +934,7 @@ public class XSerial : IXSource {
             if (j.StartsWith("{") && j.EndsWith("}")) { hub.OnCfg(j); if (hub.Status != "live") hub.Status = "connected"; pos = d + L; }
             else pos = m + 1;
           } else if (png) { hub.OnPong(Encoding.ASCII.GetString(acc, d, L)); pos = d + L; }
+          else if (tsp) { if (!double.TryParse(Encoding.ASCII.GetString(acc, d, L), out ts)) ts = -1; pos = d + L; }
           else { hub.OnMsg("camera says: " + Encoding.ASCII.GetString(acc, d, L)); pos = d + L; }
         }
         if (pos > 0) { Buffer.BlockCopy(acc, pos, acc, 0, len - pos); len -= pos; }
@@ -1005,7 +1079,7 @@ public class XDemo : IXSource {
         try {
           byte[] fr = Render(t, jpg); fpsN++;
           lock (wlk) { wFrame = fr; wTs = XHub.NowMs + BoardOffset - 30; wSeq++; Monitor.PulseAll(wlk); }
-          if (Get("usb") == 1) hub.OnFrame(fr);
+          if (Get("usb") == 1) hub.OnUsbFrame(fr, XHub.NowMs + BoardOffset - 15);
         } catch (Exception e) { hub.OnMsg("demo: " + e.Message); }
       }
       Thread.Sleep(4);
@@ -1339,7 +1413,43 @@ public class XWeb {
         else { Json(ns, Ok(false, null)); return; }
         hub.StartSource(); Json(ns, Ok(true, null)); return;
       }
+      case "/api/link": hub.LinkMgr.SetMode(G(q, "m")); Json(ns, Ok(true, null)); return;
+      case "/api/link/host": {
+        string h = G(q, "h").Trim();
+        if (h.Length > 0 && !Regex.IsMatch(h, "^[A-Za-z0-9.-]{1,64}(:[0-9]{1,5})?$")) { Json(ns, Ok(false, "\"err\":\"type an address like 192.168.4.1\"")); return; }
+        hub.LinkMgr.SetHost(h); Json(ns, Ok(true, null)); return;
+      }
+      case "/api/test/start":
+        try { hub.Test.Start(D(q, "sec", 30), G(q, "ant"), G(q, "note")); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/test/stop": hub.Test.Stop(); Json(ns, Ok(true, null)); return;
+      case "/api/test/list": Json(ns, hub.Test.ListJson()); return;
+      case "/api/test/delete":
+        try { hub.Test.Delete(G(q, "id")); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/test/note":
+        try { hub.Test.Rename(G(q, "id"), G(q, "note")); Json(ns, Ok(true, null)); }
+        catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      case "/api/test/open": {
+        string f = G(q, "id") == "" ? null : hub.Test.FileFor(G(q, "id"), ".avi");
+        try {
+          if (G(q, "id") == "") { Directory.CreateDirectory(hub.Test.Dir); Process.Start("explorer.exe", "\"" + hub.Test.Dir + "\""); }
+          else if (f == null) throw new Exception("video not found");
+          else Process.Start(f);
+          Json(ns, Ok(true, null));
+        } catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
+        return;
+      }
+      case "/test/thumb": {
+        string f = hub.Test.FileFor(G(q, "id"), ".jpg");
+        if (f == null) Send(ns, "404 Not Found", "text/plain", Encoding.ASCII.GetBytes("no")); else Send(ns, "200 OK", "image/jpeg", File.ReadAllBytes(f));
+        return;
+      }
       case "/api/crazy/start":
+        if (hub.Test.Running) { Json(ns, Ok(false, "\"err\":\"a link test is running\"")); return; }
         try { hub.Crazy.Mode = G(q, "mode") == "wifi" ? "wifi" : "usb"; hub.Crazy.Quick = G(q, "quick") == "1"; hub.Crazy.MaxRounds = (int)D(q, "rounds", 0); hub.Crazy.Start(); Json(ns, Ok(true, null)); }
         catch (Exception e) { Json(ns, Ok(false, "\"err\":\"" + XHub.Esc(e.Message) + "\"")); }
         return;
@@ -2144,6 +2254,275 @@ public class XWifi {
 }
 
 // ============================================================================
+//  Link: where the video comes from - USB cable or WiFi (board's :81/stream).
+//  On WiFi the board can stay on USB (settings + clock over the cable) or run
+//  on a battery (settings, status and clock over WiFi: /cmd /status /ping).
+// ============================================================================
+public class XLink {
+  readonly XHub hub; Thread th; volatile bool run;
+  XWifi wifi; string wifiUrl = "";
+  public volatile string Mode = "usb";     // "usb" | "wifi"
+  public volatile string Host = "";        // manual camera address for WiFi ("" = automatic)
+  public volatile string Status = "";
+  public volatile bool OverWifi;           // board settings/status come over WiFi (no USB)
+  DateTime lastPing = DateTime.MinValue, lastStatus = DateTime.MinValue, lastUsbFix = DateTime.MinValue, lastResolve = DateTime.MinValue, lastClockReset = DateTime.Now;
+  public XLink(XHub h) { hub = h; }
+  public void Start() { run = true; th = new Thread(Loop); th.IsBackground = true; th.Start(); }
+  public void Stop() { run = false; StopWifi(); }
+  public string Url { get { return wifiUrl; } }
+  public long WifiFrames { get { XWifi w = wifi; return w == null ? 0 : w.Frames; } }
+
+  public void SetMode(string m) {
+    m = m == "wifi" ? "wifi" : "usb";
+    if (m == Mode) return;
+    Mode = m;
+    StopWifi();
+    hub.ResetClock(); lastPing = DateTime.MinValue; lastUsbFix = DateTime.MinValue;
+    if (hub.Source != null && hub.Source.Connected) hub.Source.Send(m == "wifi" ? "set usb 0" : "set usb 1");
+  }
+  public void SetHost(string h) { Host = h; StopWifi(); lastResolve = DateTime.MinValue; }
+
+  bool UsbUp { get { IXSource s = hub.Source; return s != null && s.Connected; } }
+
+  string BoardStr(string k) {
+    try {
+      var d = XCrazy.Js().DeserializeObject(hub.BoardJson) as Dictionary<string, object>;
+      return d != null && d.ContainsKey(k) ? Convert.ToString(d[k]) : "";
+    } catch { return ""; }
+  }
+
+  // camera address: manual, else what the board says (demo: stream_url), else the hotspot default
+  public string Resolve() {
+    string h = (Host ?? "").Trim();
+    if (h.Length > 0) return "http://" + h.Replace("http://", "").TrimEnd('/') + ":81/stream";
+    string su = BoardStr("stream_url"); if (su.Length > 0) return su;
+    string sta = BoardStr("sta_ip"), ap = BoardStr("ap_ip");
+    var c = new List<string>();
+    if (sta.Length > 0) c.Add("http://" + sta + ":81/stream");
+    if (ap.Length > 0) c.Add("http://" + ap + ":81/stream");
+    if (c.Count == 0) c.Add("http://192.168.4.1:81/stream");
+    if (c.Count > 1) foreach (string u in c) if (XWifi.Reachable(u, 700)) return u;
+    return c[0];
+  }
+  public string BaseUrl { get { try { var u = new Uri(wifiUrl.Length > 0 ? wifiUrl : Resolve()); return "http://" + u.Host + (u.Port == 81 ? "" : ":" + u.Port); } catch { return "http://192.168.4.1"; } } }
+
+  static string Get(string url, int ms) {
+    var rq = (HttpWebRequest)WebRequest.Create(url);
+    rq.Timeout = ms; rq.ReadWriteTimeout = ms; rq.KeepAlive = false; rq.Proxy = null;
+    using (var r = rq.GetResponse()) using (var sr = new StreamReader(r.GetResponseStream())) return sr.ReadToEnd();
+  }
+  // a command over WiFi (board on battery)
+  public bool SendWifi(string line) {
+    if (Mode != "wifi") return false;
+    try { return Get(BaseUrl + "/cmd?c=" + Uri.EscapeDataString(line), 2500).IndexOf("true", StringComparison.Ordinal) >= 0; }
+    catch (Exception e) { hub.SendErr = "WiFi: " + e.Message; return false; }
+  }
+
+  // several pings, the fastest round trip wins (USB or WiFi)
+  public void PingBurst() {
+    hub.ResetClock();
+    for (int i = 0; i < 8; i++) { Ping(); Thread.Sleep(60); }
+    lastPing = DateTime.Now; lastClockReset = DateTime.Now;
+  }
+  void Ping() {
+    string t = ((long)XHub.NowMs).ToString();
+    if (UsbUp) { hub.Source.Send("ping " + t); return; }
+    if (Mode == "wifi") { try { hub.OnPong(Get(BaseUrl + "/ping?t=" + t, 1500)); } catch { } }
+  }
+
+  void StopWifi() { XWifi w = wifi; wifi = null; if (w != null) w.Stop(); }
+
+  void Loop() {
+    while (run) {
+      try { Tick(); } catch (Exception e) { Status = "link error: " + e.Message; }
+      Thread.Sleep(250);
+    }
+  }
+  void Tick() {
+    XCrazy cz = hub.Crazy;
+    if (cz != null && cz.Running) { StopWifi(); Status = "paused (crazy mode)"; return; }
+    DateTime now = DateTime.Now;
+    OverWifi = Mode == "wifi" && !UsbUp;
+    // the board clock drifts a little: re-sync every minute
+    if ((now - lastClockReset).TotalSeconds > 60 && (hub.Test == null || !hub.Test.Running)) { hub.ResetClock(); lastClockReset = now; }
+    if ((now - lastPing).TotalSeconds > 2) { lastPing = now; Ping(); }
+    if (Mode == "usb") {
+      StopWifi();
+      Status = UsbUp ? "USB cable" : "waiting for the USB cable";
+      if (UsbUp && BoardStr("usb") == "0" && (now - lastUsbFix).TotalSeconds > 3) { lastUsbFix = now; hub.Source.Send("set usb 1"); }
+      return;
+    }
+    // ---- WiFi ----
+    if (UsbUp && BoardStr("usb") == "1" && (now - lastUsbFix).TotalSeconds > 3) { lastUsbFix = now; hub.Source.Send("set usb 0"); }
+    if (OverWifi && (now - lastStatus).TotalSeconds >= 1) {
+      lastStatus = now;
+      try { string j = Get(BaseUrl + "/status", 2000); if (j.StartsWith("{")) hub.OnCfg(j); } catch { }
+    }
+    if (wifi == null || ((now - lastResolve).TotalSeconds > 8 && !hub.IsLive)) {
+      lastResolve = now;
+      string u = Resolve();
+      if (wifi == null || u != wifiUrl) { StopWifi(); wifiUrl = u; var w = new XWifi(hub, u); w.Start(); wifi = w; }
+    }
+    XWifi cur = wifi;
+    string ws = cur == null ? "" : cur.Status;
+    Status = hub.IsLive ? "WiFi " + new Uri(wifiUrl).Host : "connecting to " + new Uri(wifiUrl).Host + (ws.Length > 0 && ws != "connected" ? " - " + ws : "");
+  }
+
+  public string StateJson() {
+    var o = new Dictionary<string, object>();
+    o["mode"] = Mode; o["host"] = Host; o["url"] = wifiUrl; o["status"] = Status; o["overWifi"] = OverWifi;
+    o["clock"] = double.IsNaN(hub.ClockOffset) ? -1 : Math.Round(hub.ClockRtt, 1);
+    return XCrazy.Js().Serialize(o);
+  }
+}
+
+// ============================================================================
+//  Link test: record N seconds of exactly what arrives on the PC, measure it,
+//  keep the AVI (real timing - freezes stay visible) + a result row
+// ============================================================================
+public class XTest {
+  readonly XHub hub; Thread th; volatile bool running, stopNow;
+  public string Dir = "";
+  public volatile string Phase = "idle", Err = "";
+  public double Seconds; public DateTime Started;
+  readonly object fl = new object();
+  public XTest(XHub h) { hub = h; }
+  public bool Running { get { return running; } }
+  string ResultsPath { get { return Path.Combine(Dir, "results.json"); } }
+
+  public void Start(double sec, string antenna, string note) {
+    if (running) throw new Exception("a test is already running");
+    XCrazy cz = hub.Crazy; if (cz != null && cz.Running) throw new Exception("stop crazy mode first");
+    if (!hub.IsLive) throw new Exception(hub.LinkMgr.Mode == "wifi" ? "no WiFi video yet - is this PC on the camera's WiFi?" : "no picture from the camera");
+    if (hub.Rec != null) throw new Exception("stop the recording first");
+    Seconds = Math.Max(3, Math.Min(600, sec));
+    Err = ""; stopNow = false; running = true; Phase = "preparing";
+    string ant = antenna == "yes" || antenna == "no" ? antenna : "";
+    string nt = (note ?? "").Replace("\r", " ").Replace("\n", " ");
+    if (nt.Length > 80) nt = nt.Substring(0, 80);
+    th = new Thread(delegate() { Run(ant, nt); }); th.IsBackground = true; th.Start();
+  }
+  public void Stop() { stopNow = true; }
+
+  static double Num(Dictionary<string, object> d, string k) {
+    object v; if (d == null || !d.TryGetValue(k, out v) || v == null) return double.NaN;
+    try { return Convert.ToDouble(v, System.Globalization.CultureInfo.InvariantCulture); } catch { return double.NaN; }
+  }
+  Dictionary<string, object> Board() { try { return XCrazy.Js().DeserializeObject(hub.BoardJson) as Dictionary<string, object>; } catch { return null; } }
+
+  void Run(string antenna, string note) {
+    try {
+      string link = hub.LinkMgr.Mode;
+      while (!stopNow && (DateTime.Now - hub.LastSetAt).TotalSeconds < 4) { Phase = "letting the picture settle"; Thread.Sleep(100); }
+      Phase = "syncing clocks";
+      hub.LinkMgr.PingBurst();
+      Thread.Sleep(400);
+      var b0 = Board();
+      string pcWifi = link == "wifi" ? XWifi.PcSignal() : "";
+      var clip = new XClip(null);
+      var cam = new List<double>(); var rssi = new List<double>();
+      Started = DateTime.Now; Phase = "recording";
+      hub.Tap = clip.Add;
+      double secs;
+      try {
+        DateTime next = DateTime.Now.AddSeconds(1);
+        while (!stopNow && (DateTime.Now - Started).TotalSeconds < Seconds) {
+          Thread.Sleep(50);
+          if (DateTime.Now >= next) {
+            next = next.AddSeconds(1);
+            var b = Board();
+            double cf = Num(b, "cap_fps"); if (!double.IsNaN(cf) && cf > 0) cam.Add(cf);
+            double rs = Num(b, "rssi"); if (double.IsNaN(rs) || rs == 0) rs = Num(b, "ap_rssi");
+            if (!double.IsNaN(rs) && rs != 0) rssi.Add(rs);
+          }
+        }
+      } finally { hub.Tap = null; }
+      secs = Math.Min(Seconds, (DateTime.Now - Started).TotalSeconds);
+      clip.Done(secs);
+      Phase = "saving";
+      var r = new XScores();
+      clip.FillStats(r);
+      if (clip.Count > 0) {
+        byte[] th2; var pic = XScore.Compute(clip.Middle, out th2);
+        r.Sharp = pic.Sharp; r.Noise = pic.Noise; r.W = pic.W; r.H = pic.H;
+      }
+      Directory.CreateDirectory(Dir);
+      string id = DateTime.Now.ToString("yyyy-MM-dd_HHmmss") + "_" + (link == "wifi" ? "wifi" + (antenna == "yes" ? "-antenna" : antenna == "no" ? "-no-antenna" : "") : "usb");
+      if (clip.Count > 0) {
+        clip.WriteAvi(Path.Combine(Dir, id + ".avi"));
+        File.WriteAllBytes(Path.Combine(Dir, id + ".jpg"), clip.Middle);
+      }
+      double camFps = cam.Count > 0 ? Avg(cam) : double.NaN;
+      var d = new Dictionary<string, object>();
+      d["id"] = id; d["time"] = DateTime.Now.ToString("s"); d["link"] = link; d["antenna"] = antenna; d["note"] = note;
+      d["secs"] = Math.Round(secs, 1); d["frames"] = r.Frames; d["w"] = r.W; d["h"] = r.H;
+      d["fps"] = Math.Round(r.Fps, 1); d["camFps"] = double.IsNaN(camFps) ? -1 : Math.Round(camFps, 1);
+      d["delivered"] = double.IsNaN(camFps) || camFps <= 0 ? -1 : Math.Round(Math.Min(100, r.Fps / camFps * 100));
+      d["kbps"] = Math.Round(r.Kbps); d["kbFrame"] = r.Frames > 0 ? Math.Round(r.Kbps / Math.Max(0.1, r.Fps), 1) : 0;
+      d["freezes"] = r.Stalls; d["maxGap"] = Math.Round(r.MaxGap); d["jitter"] = Math.Round(r.Jitter, 1);
+      d["lat"] = Math.Round(r.LatMed); d["lat90"] = Math.Round(r.LatP90);
+      d["rssi"] = rssi.Count > 0 ? Math.Round(Avg(rssi)) : 0; d["rssiMin"] = rssi.Count > 0 ? Min(rssi) : 0;
+      d["pcWifi"] = pcWifi;
+      d["sharp"] = Math.Round(r.Sharp, 2);
+      d["quality"] = Num(b0, "quality"); d["txPower"] = Num(b0, "tx_power"); d["wifiMode"] = Num(b0, "wifi");
+      d["overWifi"] = hub.LinkMgr.OverWifi;
+      d["video"] = clip.Count > 0;
+      lock (fl) { var list = Load(); list.Insert(0, d); Save(list); }
+      Phase = "done";
+    } catch (Exception e) { Err = e.Message; Phase = "failed"; }
+    finally { running = false; }
+  }
+  static double Avg(List<double> v) { double s = 0; foreach (double x in v) s += x; return s / v.Count; }
+  static double Min(List<double> v) { double m = double.MaxValue; foreach (double x in v) m = Math.Min(m, x); return m; }
+
+  List<object> Load() {
+    try { if (File.Exists(ResultsPath)) { var a = XCrazy.Js().DeserializeObject(File.ReadAllText(ResultsPath)) as object[]; if (a != null) return new List<object>(a); } } catch { }
+    return new List<object>();
+  }
+  void Save(List<object> list) {
+    Directory.CreateDirectory(Dir);
+    string tmp = ResultsPath + ".tmp";
+    File.WriteAllText(tmp, XCrazy.Js().Serialize(list));
+    if (File.Exists(ResultsPath)) File.Delete(ResultsPath);
+    File.Move(tmp, ResultsPath);
+  }
+  public string ListJson() { lock (fl) return XCrazy.Js().Serialize(Load()); }
+
+  static readonly Regex IdRx = new Regex("^[0-9A-Za-z_-]{6,60}$");
+  public string FileFor(string id, string ext) {
+    if (id == null || !IdRx.IsMatch(id)) return null;
+    string p = Path.Combine(Dir, id + ext);
+    return File.Exists(p) ? p : null;
+  }
+  public void Delete(string id) {
+    if (id == null || !IdRx.IsMatch(id)) throw new Exception("bad id");
+    lock (fl) {
+      var list = Load();
+      list.RemoveAll(o => { var d = o as Dictionary<string, object>; return d != null && Convert.ToString(d["id"]) == id; });
+      Save(list);
+    }
+    foreach (string e in new[] { ".avi", ".jpg" }) { string p = Path.Combine(Dir, id + e); if (File.Exists(p)) File.Delete(p); }
+  }
+  public void Rename(string id, string note) {
+    if (id == null || !IdRx.IsMatch(id)) throw new Exception("bad id");
+    note = (note ?? "").Replace("\r", " ").Replace("\n", " "); if (note.Length > 80) note = note.Substring(0, 80);
+    lock (fl) {
+      var list = Load();
+      foreach (object o in list) { var d = o as Dictionary<string, object>; if (d != null && Convert.ToString(d["id"]) == id) d["note"] = note; }
+      Save(list);
+    }
+  }
+
+  public string StateJson() {
+    var o = new Dictionary<string, object>();
+    o["running"] = running; o["phase"] = Phase; o["err"] = Err; o["secs"] = Seconds;
+    o["elapsed"] = running && Phase == "recording" ? Math.Round((DateTime.Now - Started).TotalSeconds, 1) : 0;
+    o["dir"] = Dir;
+    return XCrazy.Js().Serialize(o);
+  }
+}
+
+// ============================================================================
 //  Updates from GitHub (public repo) + restart / re-flash from the Studio
 // ============================================================================
 public static class XUpdate {
@@ -2834,8 +3213,8 @@ function updBoard(){if(!B){$('#bInfo').innerHTML='<span>Status</span><b>not conn
 // ---------- viewer: fit, zoom, pan, rotate ----------
 const V={rot:0,mir:false,z:1,x:0,y:0,grid:false,cross:false,pause:false};
 const img=$('#v'),box=$('#box'),stage=$('#stage');
-function startStream(){img.src='/stream?'+Date.now()}
-img.onload=layout;img.onerror=()=>setTimeout(startStream,1500);
+function startStream(){if(document.body.classList.contains('adv'))img.src='/stream?'+Date.now()}
+img.onload=layout;img.onerror=()=>{if(img.getAttribute('src'))setTimeout(startStream,1500)};
 function layout(){const w=img.naturalWidth||(P&&P.w)||4,h=img.naturalHeight||(P&&P.h)||3;const sw=stage.clientWidth,sh=stage.clientHeight;const rot=V.rot%180!==0;
   const s=Math.min(sw/(rot?h:w),sh/(rot?w:h));box.style.width=w*s+'px';box.style.height=h*s+'px';
   box.style.transform=`translate(-50%,-50%) translate(${V.x}px,${V.y}px) scale(${V.z}) rotate(${V.rot}deg) scaleX(${V.mir?-1:1})`;
@@ -2862,7 +3241,7 @@ addEventListener('keydown',e=>{if(e.target.matches('input,select,textarea')||doc
 // ---------- focus helper + histogram (from /frame.jpg) ----------
 const cv=document.createElement('canvas'),cx=cv.getContext('2d',{willReadFrequently:true});let fPeak=0,busy=false;
 $('#focReset').onclick=()=>{fPeak=0};
-async function analyse(){if(busy||!P||!P.live||document.hidden)return;busy=true;
+async function analyse(){if(busy||!P||!P.live||document.hidden||!document.body.classList.contains('adv'))return;busy=true;
   try{const bl=await (await fetch('/frame.jpg',{cache:'no-store'})).blob();const bm=await createImageBitmap(bl);
     const W=240,H=Math.round(W*bm.height/bm.width);cv.width=W;cv.height=H;cx.drawImage(bm,0,0,W,H);
     const d=cx.getImageData(0,0,W,H).data;const hist=new Array(256).fill(0);const g=new Float32Array(W*H);
@@ -2903,7 +3282,7 @@ async function poll(){const s=await api('/api/state');if(s&&s.pc){if(poll.down){
     const g=$('#recGo');g.classList.toggle('on',!!r);g.textContent=r?'Stop recording':'Start recording';
     $('#recInfo').innerHTML=r?[['File',r.file],['Time',mmss(r.secs)],['Frames',r.frames],['Size',r.mb.toFixed(1)+' MB'],['Frame rate',r.tl?'1 every '+r.tl+' s':r.fps+' fps'],['Sound',r.audio?'yes':'no']].map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join(''):`<span>Folder</span><b title="${P.videos}">${P.videos}</b>`;
     const micOn=B&&B.mic;$('#micState').textContent=micOn?'on':'off';$('#vu').style.width=micOn?Math.min(100,P.level*130)+'%':'0';$('#micHint').textContent=micOn?'Level from the board microphone.':'Turn the mic on in the Record tab.';
-    updCrazy(s.crazy);
+    updCrazy(s.crazy);if(typeof sUpd==='function')sUpd(s);
     if(P.msg&&P.msg!==poll.msg){if(poll.msg!==undefined)toast(P.msg);poll.msg=P.msg}}
   refresh()}
 TABS.forEach(([id,label,items],i)=>{
@@ -2920,7 +3299,210 @@ setInterval(poll,500);poll();
 $('#snapTop').onclick=snap;$('#recBtnTop').onclick=toggleRec;
 $('#quitTop').onclick=async()=>{if(!$('#quitTop').dataset.arm){$('#quitTop').dataset.arm=1;$('#quitTop').textContent='Click to confirm';setTimeout(()=>{delete $('#quitTop').dataset.arm;$('#quitTop').textContent='Quit'},3000);return}
   await api('/api/quit');document.body.innerHTML='<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#8b94a1">Studio stopped. You can close this tab.</div>'};
-</script></body></html>
+</script>
+<style>
+body:not(.adv) #app{display:none}body.adv #simple{display:none}
+#simple{display:grid;grid-template-rows:50px 1fr;height:100%}
+#simple header .sp{flex:1}
+#sMain{display:grid;grid-template-columns:1fr 360px;min-height:0}
+#sLeft{display:grid;grid-template-rows:1fr auto;min-height:0;min-width:0}
+#sStage{position:relative;background:#050607;overflow:hidden;min-height:200px}
+#sv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+#sLive{position:absolute;left:12px;top:12px;display:flex;gap:6px;flex-wrap:wrap;z-index:2}
+#sLive span{background:rgba(13,15,18,.82);backdrop-filter:blur(6px);border:1px solid var(--ln);border-radius:7px;padding:5px 10px;color:var(--mu);font-variant-numeric:tabular-nums}
+#sLive b{color:var(--tx);font-size:15px;margin-right:3px}
+#sEmpty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--mu);text-align:center;padding:24px}
+#sEmpty b{color:var(--tx);font-size:16px}
+#sProg{position:absolute;left:0;right:0;bottom:0;padding:12px 14px;background:linear-gradient(transparent,rgba(5,6,7,.92));display:none;z-index:2}
+#sProg .bar{height:6px;border-radius:3px;background:#20242b;overflow:hidden;margin-top:6px}#sProg .bar i{display:block;height:100%;background:var(--er);width:0;transition:width .25s linear}
+#sProg .t{display:flex;justify-content:space-between;font-weight:600;font-variant-numeric:tabular-nums}
+#sProg .rd{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--er);margin-right:7px;animation:bl 1s infinite}
+#sRes{background:var(--p);border-top:1px solid var(--ln);max-height:38vh;overflow:auto;scrollbar-width:thin;scrollbar-color:#2a2f37 transparent}
+#sRes .hd{display:flex;align-items:center;gap:8px;padding:9px 14px 4px;position:sticky;top:0;background:var(--p);z-index:1}
+#sRes .hd b{font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:var(--mu)}#sRes .hd button{padding:3px 9px;font-size:12px}
+#sRes table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+#sRes th{font-weight:500;color:var(--mu);text-align:left;padding:4px 8px;font-size:12px;white-space:nowrap}
+#sRes td{padding:5px 8px;border-top:1px solid #1d2127;white-space:nowrap}
+#sRes img{width:64px;height:40px;object-fit:cover;border-radius:4px;display:block;background:#000}
+#sRes .note{color:var(--mu);max-width:180px;overflow:hidden;text-overflow:ellipsis;cursor:text}
+#sRes .act button{padding:3px 8px;font-size:12px}
+#sRes .empty{padding:6px 14px 14px;color:var(--mu)}
+.vd{display:inline-block;padding:2px 8px;border-radius:99px;font-weight:600;font-size:12px}
+.vd.good{background:#123320;color:#86efac}.vd.ok{background:#3a2a0c;color:#fde3a7}.vd.bad{background:#3a1414;color:#fca5a5}
+#sSide{background:var(--p);border-left:1px solid var(--ln);overflow:auto;padding:6px 16px 20px;scrollbar-width:thin;scrollbar-color:#2a2f37 transparent}
+.st{margin:16px 0 8px;font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:var(--mu);font-weight:600;display:flex;gap:8px;align-items:center}
+.st i{font-style:normal;width:18px;height:18px;border-radius:50%;background:var(--p2);border:1px solid var(--ln);display:inline-flex;align-items:center;justify-content:center;color:var(--tx);font-size:11px}
+.seg.big button{padding:10px 4px;font-weight:600}
+.seg button small{display:block;font-weight:400;color:inherit;opacity:.7;font-size:11px}
+#sWifiBox{margin-top:8px;background:var(--bg);border:1px solid var(--ln);border-radius:var(--r);padding:10px}
+#sWifiMsg{margin-top:8px;font-size:12px;color:var(--mu)}#sWifiMsg b{color:var(--tx)}
+details.more{margin-top:8px}details.more summary{cursor:pointer;color:var(--mu);font-size:12px;list-style:none}details.more summary::before{content:"\25B8  "}details.more[open] summary::before{content:"\25BE  "}
+#sGo{width:100%;padding:13px;font-size:15px;font-weight:700;margin-top:12px}
+#sGo.on{background:var(--er);border-color:var(--er)}
+#sLast{margin-top:12px;background:var(--bg);border:1px solid var(--ln);border-radius:var(--r);padding:10px;display:none}
+#sLast .vd{font-size:14px;padding:3px 12px}
+#sLast .kv{margin-top:8px}
+#sAdv{display:flex;align-items:center;gap:6px}
+#sRecB.on{background:#3a1414;border-color:var(--er);color:#fecaca}
+</style>
+<div id="simple">
+<header>
+  <div class="brand"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><rect x="2" y="6" width="20" height="14" rx="3"/><circle cx="12" cy="13" r="4"/><path d="M8 6l1.5-2h5L16 6"/></svg>XIAO CAM <small>Link test</small></div>
+  <div class="pill"><span class="dot" id="sDot"></span><span id="sStat">starting...</span></div>
+  <div class="sp"></div>
+  <button id="sRecB" title="Record what arrives on this PC, until you press again">Record</button>
+  <button id="sAdv" title="All camera settings, crazy mode, profiles, updates">Advanced settings</button>
+  <button id="sQuit">Quit</button>
+</header>
+<div id="sMain">
+  <div id="sLeft">
+    <div id="sStage">
+      <img id="sv" alt="">
+      <div id="sEmpty"><b id="sEmptyT">No picture yet</b><span id="sEmptyS">Waiting for the camera...</span></div>
+      <div id="sLive"></div>
+      <div id="sProg"><div class="t"><span><span class="rd"></span><span id="sProgT">Testing</span></span><span id="sProgN"></span></div><div class="bar"><i id="sProgBar"></i></div></div>
+    </div>
+    <div id="sRes"><div class="hd"><b>Results</b><span class="sp" style="flex:1"></span><button id="sFolder">Open folder</button></div><div id="sResBody"></div></div>
+  </div>
+  <div id="sSide">
+    <div class="st"><i>1</i>Video goes over</div>
+    <div class="seg big" id="sLink"><button data-v="usb">USB cable</button><button data-v="wifi">WiFi</button></div>
+    <div id="sWifiBox" style="display:none">
+      <div class="seg" id="sAnt"><button data-v="yes">With antenna</button><button data-v="no">No antenna</button></div>
+      <div id="sWifiMsg"></div>
+      <details class="more" id="sWifiMore"><summary>WiFi setup</summary>
+        <div class="field"><label>Camera WiFi</label><div class="seg" id="sWMode"><button data-v="1">Own hotspot</button><button data-v="2">Joins my WiFi</button></div></div>
+        <div id="sWAp"><div class="two"><div class="field"><label>Hotspot name</label><input type="text" id="sApS" maxlength="32"></div><div class="field"><label>Password (8+)</label><input type="text" id="sApP" maxlength="63"></div></div></div>
+        <div id="sWSta" style="display:none"><div class="two"><div class="field"><label>My WiFi name</label><input type="text" id="sStS" maxlength="32"></div><div class="field"><label>Password</label><input type="password" id="sStP" maxlength="63"></div></div></div>
+        <div class="field"><label>Transmit power</label><select id="sTx"></select></div>
+        <button id="sWApply" class="pri" style="width:100%">Apply on the camera</button>
+        <div class="field" style="margin-top:12px"><label>Camera address (empty = automatic)</label><input type="text" id="sHost" placeholder="automatic, e.g. 192.168.4.1"></div>
+        
+      </details>
+    </div>
+    <div class="st"><i>2</i>Picture</div>
+    <div class="seg" id="sSize"><button data-v="10">Small<small>640x480</small></button><button data-v="13">Medium<small>1280x720</small></button><button data-v="max">Large<small id="sMaxL">full</small></button></div>
+    <div class="seg" id="sQual" style="margin-top:6px"><button data-v="20">Light<small>small files</small></button><button data-v="12">Normal</button><button data-v="6">Best<small>big files</small></button></div>
+    <div class="st"><i>3</i>Test</div>
+    <div class="seg" id="sLen"><button data-v="10">10 s</button><button data-v="30">30 s</button><button data-v="60">1 min</button><button data-v="300">5 min</button></div>
+    <div class="field"><label>Note (optional) - where, distance, walls...</label><input type="text" id="sNote" maxlength="80" placeholder="e.g. 10 m, one wall"></div>
+    <button id="sGo" class="pri">Start test</button>
+    <div class="hint" style="margin-top:6px">Records exactly what arrives on this PC (like the camera saving to another device) and measures it. The video is kept - freezes stay visible in it.</div>
+    <div id="sLast"></div>
+  </div>
+</div>
+</div>
+<script>
+'use strict';
+const S={link:'usb',ant:localStorage.xsAnt||'yes',len:+(localStorage.xsLen||30),tests:[],lastId:'',wasRunning:false};
+const sv=$('#sv');
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
+function isAdv(){return document.body.classList.contains('adv')}
+function setAdv(on){document.body.classList.toggle('adv',on);localStorage.xadv=on?1:0;
+  if(on){sv.removeAttribute('src');startStream();layout()}else{img.removeAttribute('src');sStream()}}
+function sStream(){if(!isAdv())sv.src='/stream?'+Date.now()}
+sv.onerror=()=>{if(!isAdv())setTimeout(sStream,1500)};
+$('#sAdv').onclick=()=>setAdv(true);
+// back button inside the full studio
+{const b=el('button','','&#8592; Simple view');b.title='Back to the link test';b.onclick=()=>setAdv(false);document.querySelector('#app header .brand').after(b)}
+
+function segOn(id,v){document.querySelectorAll(id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===String(v)))}
+function segClick(id,fn){document.querySelectorAll(id+' button').forEach(b=>b.onclick=()=>fn(b.dataset.v))}
+segClick('#sLink',async v=>{S.link=v;S.linkT=Date.now();segOn('#sLink',v);await api('/api/link?m='+v);sUpd()});
+segClick('#sAnt',v=>{S.ant=v;localStorage.xsAnt=v;segOn('#sAnt',v)});segOn('#sAnt',S.ant);
+segClick('#sLen',v=>{S.len=+v;localStorage.xsLen=v;segOn('#sLen',v)});segOn('#sLen',S.len);
+segClick('#sSize',v=>{const n=v==='max'?(B?B.max_size:15):+v;setv('framesize',n)});
+segClick('#sQual',v=>setv('quality',v));
+segClick('#sWMode',v=>{S.wmode=+v;segOn('#sWMode',v);$('#sWAp').style.display=v==='1'?'':'none';$('#sWSta').style.display=v==='2'?'':'none'});
+$('#sTx').innerHTML=TXP.map(([v,l])=>`<option value="${v}">${l}</option>`).join('');
+$('#sTx').onchange=e=>setv('tx_power',e.target.value);
+document.querySelectorAll('#sWifiMore input').forEach(i=>i.addEventListener('input',()=>i.dataset.dirty=1));
+$('#sWApply').onclick=async()=>{const m=S.wmode||1;
+  if(m===1){const ss=$('#sApS').value.trim(),pw=$('#sApP').value;if(!ss){toast('Hotspot name is empty');return}if(pw&&pw.length<8){toast('Hotspot password: 8+ characters');return}
+    await api('/api/str?k=ap_ssid&v='+encodeURIComponent(ss));await api('/api/str?k=ap_pass&v='+encodeURIComponent(pw))}
+  else{const ss=$('#sStS').value.trim();if(!ss){toast('Type your WiFi name');return}
+    await api('/api/str?k=sta_ssid&v='+encodeURIComponent(ss));await api('/api/str?k=sta_pass&v='+encodeURIComponent($('#sStP').value))}
+  const r=await api('/api/set?k=wifi&v='+m);document.querySelectorAll('#sWifiMore [data-dirty]').forEach(i=>delete i.dataset.dirty);
+  toast(r.ok?(m===2?'Camera is joining your WiFi - its address shows here in a few seconds':'Hotspot set'):noSendMsg())};
+$('#sHost').addEventListener('change',async e=>{const r=await api('/api/link/host?h='+encodeURIComponent(e.target.value.trim()));toast(r.ok?(e.target.value.trim()?'Using '+e.target.value.trim():'Address: automatic'):(r.err||'Bad address'))});
+
+$('#sGo').onclick=async()=>{const T=window.sT;
+  if(T&&T.running){await api('/api/test/stop');toast('Stopping - saving what was recorded');return}
+  const r=await api('/api/test/start?sec='+S.len+'&ant='+(S.link==='wifi'?S.ant:'')+'&note='+encodeURIComponent($('#sNote').value.trim()));
+  if(!r.ok)toast('Cannot start: '+(r.err||''))};
+$('#sRecB').onclick=toggleRec;
+$('#sFolder').onclick=()=>api('/api/test/open');
+two($('#sQuit'),'Click to confirm',async()=>{await api('/api/quit');document.body.innerHTML='<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#8b94a1">Studio stopped. You can close this tab.</div>'});
+
+// ---------- words for numbers ----------
+const sig=d=>!d?'-':d+' dBm';
+const ms=v=>v>=0?Math.round(v)+' ms':'-';
+const rate=k=>k>=1024?(k/1024).toFixed(1)+' MB/s':Math.round(k)+' KB/s';
+function linkName(t){return t.link==='wifi'?'WiFi'+(t.antenna==='yes'?' + antenna':t.antenna==='no'?' no antenna':''):'USB cable'}
+
+// ---------- live ----------
+function sUpd(s){if(!P)return;const L=s&&s.link||window.sL||{};if(s){window.sL=L;window.sT=s.test}
+  if(S.linkT&&Date.now()-S.linkT<1500){}else if(L.mode&&L.mode!==S.link){S.link=L.mode}
+  segOn('#sLink',S.link);const wf=S.link==='wifi';$('#sWifiBox').style.display=wf?'':'none';
+  const dot=$('#sDot'),st=$('#sStat');dot.className='dot '+(P.live?'ok':(P.connected||L.overWifi)?'wa':'er');
+  st.textContent=P.demo?'Demo camera'+(wf?' over WiFi':''):wf?(L.status||'WiFi'):(P.port?P.port+' - ':'')+P.status;
+  // live numbers
+  const li=[];if(P.live){li.push(`<span><b>${P.fps.toFixed(0)}</b>fps</span>`,`<span><b>${rate(P.kbps/8)}</b></span>`);if(P.lat>=0)li.push(`<span><b>${Math.round(P.lat)}</b>ms delay</span>`);
+    if(wf&&B){const r=B.rssi||B.ap_rssi;if(r)li.push(`<span><b>${r}</b>dBm signal</span>`)}if(P.w)li.push(`<span><b>${P.w}x${P.h}</b></span>`)}
+  $('#sLive').innerHTML=li.join('');
+  $('#sEmpty').style.display=P.live?'none':'flex';
+  if(wf){$('#sEmptyT').textContent='No WiFi video yet';$('#sEmptyS').innerHTML=wifiHelp(true)}
+  else{$('#sEmptyT').textContent='No picture yet';$('#sEmptyS').textContent=P.connected?(P.oldfw?'Old firmware on the camera - open Advanced settings and flash it.':'Connected - waiting for pictures...'):'Plug the XIAO in with a USB-C data cable.'}
+  if(P.live&&!sUpd.live&&!isAdv())sStream();sUpd.live=P.live;
+  if(wf)$('#sWifiMsg').innerHTML=wifiHelp(false);
+  // picture + wifi fields
+  if(B){segOn('#sSize',B.framesize===B.max_size?'max':B.framesize);segOn('#sQual',B.quality);$('#sMaxL').textContent=B.sizes&&B.sizes[B.max_size]?B.sizes[B.max_size].join('x'):'full';
+    const fill=(id,v)=>{const e=$(id);if(e&&!e.dataset.dirty&&document.activeElement!==e&&v!==undefined)e.value=v};
+    fill('#sApS',B.ap_ssid);fill('#sApP',B.ap_pass);fill('#sStS',B.sta_ssid);fill('#sStP',B.sta_pass);fill('#sTx',B.tx_power);
+    if(!S.wmode){S.wmode=B.wifi&2?2:1;segOn('#sWMode',S.wmode);$('#sWAp').style.display=S.wmode===1?'':'none';$('#sWSta').style.display=S.wmode===2?'':'none'}}
+  const hi=$('#sHost');if(document.activeElement!==hi&&L.host!==undefined&&!hi.dataset.dirty)hi.value=L.host;
+  // record button
+  const r=P.rec;$('#sRecB').classList.toggle('on',!!r);$('#sRecB').textContent=r?'Stop recording '+mmss(r.secs):'Record';
+  // test
+  const T=window.sT||{};const g=$('#sGo');g.classList.toggle('on',!!T.running);
+  g.textContent=T.running?(T.phase==='recording'?'Stop test':T.phase+'...'):'Start test';
+  $('#sProg').style.display=T.running?'block':'none';
+  if(T.running){$('#sProgT').textContent=T.phase==='recording'?'Testing '+linkName({link:S.link,antenna:wf?S.ant:''}):T.phase;$('#sProgN').textContent=T.phase==='recording'?mmss(T.elapsed)+' / '+mmss(T.secs):'';$('#sProgBar').style.width=(T.secs?Math.min(100,T.elapsed/T.secs*100):0)+'%'}
+  if(S.wasRunning&&!T.running){if(T.err)toast('Test failed: '+T.err);loadTests(true)}S.wasRunning=!!T.running}
+function wifiHelp(big){if(!B&&!P.demo)return'Plug the camera into USB once to set up WiFi, or type its address in WiFi setup.';
+  const L=window.sL||{};const host=L.url?L.url.replace(/^http:\/\/|:81\/stream$/g,''):'';
+  if(P.live)return`Receiving over WiFi from <b>${esc(host)}</b>`+(L.overWifi?' (camera not on USB - settings go over WiFi)':'')+'.';
+  if(B&&(B.wifi&2)&&B.sta_ip)return`The camera is on your WiFi <b>${esc(B.sta_ssid)}</b> at <b>${esc(B.sta_ip)}</b>. This PC must be on the same network.`;
+  if(B&&(B.wifi&2)&&!B.sta_ip)return`The camera is trying to join <b>${esc(B.sta_ssid||'?')}</b> (${esc(STA[B.sta_status]||'...')}).`;
+  if(B&&(B.wifi&1))return`Connect this PC to the WiFi <b>${esc(B.ap_ssid)}</b> (password <b>${esc(B.ap_pass||'none')}</b>) - Windows WiFi menu, bottom right.`+(big?'':' No WiFi on this PC? Use WiFi setup: Joins my WiFi.');
+  if(B&&!B.wifi)return'WiFi is off on the camera. Open WiFi setup and press Apply.';
+  return'Looking for the camera on '+esc(host||'192.168.4.1')+'...'}
+
+// ---------- results ----------
+async function loadTests(showLast){const r=await api('/api/test/list');if(!Array.isArray(r))return;S.tests=r;drawTests();if(showLast&&r[0])drawLast(r[0])}
+function drawLast(t){const d=$('#sLast');d.style.display='block';
+  d.innerHTML=`<b>Last test: ${esc(linkName(t))}</b>
+  <div class="kv">${[['Frames per second',t.fps+(t.camFps>0?' of '+t.camFps:'')],['Arrived',t.delivered>=0?t.delivered+'%':'-'],['Freezes',t.freezes+(t.freezes?' (longest '+ms(t.maxGap)+')':'')],['Delay',ms(t.lat)+(t.lat90>=0?' (worst '+ms(t.lat90)+')':'')],['Signal',t.link==='wifi'?sig(t.rssi):'cable'],['Data',rate(t.kbps)]].map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join('')}</div>
+  <div class="btns">${t.video?`<button onclick="playTest('${t.id}')">Play video</button>`:''}</div>`}
+const COLS=[['fps','fps',1],['delivered','Arrived',1],['freezes','Freezes',-1],['maxGap','Longest freeze',-1],['lat','Delay',-1],['rssi','Signal',1],['kbps','Data',1]];
+function drawTests(){const b=$('#sResBody');const T=S.tests;
+  if(!T.length){b.innerHTML='<div class="empty">No tests yet. Pick how the video goes, press <b>Start test</b>. Then switch (antenna / no antenna / cable) and test again - results line up here.</div>';return}
+  const cell=(t,k,txt)=>`<td>${txt}</td>`;
+  b.innerHTML=`<table><tr><th></th><th>When</th><th>Link</th><th>Note</th><th>Picture</th>${COLS.map(c=>`<th>${c[1]}</th>`).join('')}<th></th></tr>`+T.map(t=>`<tr>
+    <td>${t.video?`<img src="/test/thumb?id=${t.id}" loading="lazy">`:''}</td><td>${esc((t.time||'').replace('T',' ').slice(5,16))}</td><td><b>${esc(linkName(t))}</b></td>
+    <td class="note" data-id="${t.id}" title="Click to edit">${esc(t.note)||'<span style="opacity:.5">+ note</span>'}</td>
+<td>${t.w}x${t.h} q${t.quality}</td>
+    ${cell(t,'fps',t.fps)}${cell(t,'delivered',t.delivered>=0?t.delivered+'%':'-')}${cell(t,'freezes',t.freezes)}${cell(t,'maxGap',ms(t.maxGap))}${cell(t,'lat',ms(t.lat))}${cell(t,'rssi',t.link==='wifi'?(t.rssi?t.rssi+' dBm':'-'):'cable')}${cell(t,'kbps',rate(t.kbps))}
+    <td class="act">${t.video?`<button onclick="playTest('${t.id}')">Play</button> `:''}<button class="danger" data-del="${t.id}">Delete</button></td></tr>`).join('')+'</table>';
+  b.querySelectorAll('[data-del]').forEach(x=>two(x,'Sure?',async()=>{await api('/api/test/delete?id='+x.dataset.del);loadTests()}));
+  b.querySelectorAll('.note').forEach(n=>n.onclick=()=>{if(n.querySelector('input'))return;const t=S.tests.find(z=>z.id===n.dataset.id);const i=el('input');i.type='text';i.maxLength=80;i.value=t.note||'';n.innerHTML='';n.appendChild(i);i.focus();
+    const done=async()=>{await api('/api/test/note?id='+t.id+'&note='+encodeURIComponent(i.value.trim()));loadTests()};i.onblur=done;i.onkeydown=e=>{if(e.key==='Enter')i.blur();if(e.key==='Escape'){i.onblur=null;drawTests()}}})}
+async function playTest(id){const r=await api('/api/test/open?id='+id);if(!r.ok)toast(r.err||'Cannot open')}
+
+if(localStorage.xadv==='1')setAdv(true);else{img.removeAttribute('src');sStream()}
+loadTests(false);
+</script>
+</body></html>
 '@
 
 # ----------------------------------------------------------------------------
@@ -3026,6 +3608,7 @@ function Start-Studio([bool]$demo) {
   $hub.Version = $StudioVersion; $hub.FwExpected = $FirmwareVersion; $hub.SelfPath = $env:XCAM_SELF
   $hub.PicturesDir = Join-Path $Root 'pictures'
   $hub.VideosDir = Join-Path $Root 'videos'
+  $hub.TestsDir = Join-Path $Root 'link-tests'
   $hub.Demo = $demo
   [XHub]::HookConsole($hub)
   $hub.StartAll((Join-Path $Root 'crazy'))

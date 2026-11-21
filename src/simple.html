@@ -1,0 +1,202 @@
+<style>
+body:not(.adv) #app{display:none}body.adv #simple{display:none}
+#simple{display:grid;grid-template-rows:50px 1fr;height:100%}
+#simple header .sp{flex:1}
+#sMain{display:grid;grid-template-columns:1fr 360px;min-height:0}
+#sLeft{display:grid;grid-template-rows:1fr auto;min-height:0;min-width:0}
+#sStage{position:relative;background:#050607;overflow:hidden;min-height:200px}
+#sv{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+#sLive{position:absolute;left:12px;top:12px;display:flex;gap:6px;flex-wrap:wrap;z-index:2}
+#sLive span{background:rgba(13,15,18,.82);backdrop-filter:blur(6px);border:1px solid var(--ln);border-radius:7px;padding:5px 10px;color:var(--mu);font-variant-numeric:tabular-nums}
+#sLive b{color:var(--tx);font-size:15px;margin-right:3px}
+#sEmpty{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--mu);text-align:center;padding:24px}
+#sEmpty b{color:var(--tx);font-size:16px}
+#sProg{position:absolute;left:0;right:0;bottom:0;padding:12px 14px;background:linear-gradient(transparent,rgba(5,6,7,.92));display:none;z-index:2}
+#sProg .bar{height:6px;border-radius:3px;background:#20242b;overflow:hidden;margin-top:6px}#sProg .bar i{display:block;height:100%;background:var(--er);width:0;transition:width .25s linear}
+#sProg .t{display:flex;justify-content:space-between;font-weight:600;font-variant-numeric:tabular-nums}
+#sProg .rd{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--er);margin-right:7px;animation:bl 1s infinite}
+#sRes{background:var(--p);border-top:1px solid var(--ln);max-height:38vh;overflow:auto;scrollbar-width:thin;scrollbar-color:#2a2f37 transparent}
+#sRes .hd{display:flex;align-items:center;gap:8px;padding:9px 14px 4px;position:sticky;top:0;background:var(--p);z-index:1}
+#sRes .hd b{font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:var(--mu)}#sRes .hd button{padding:3px 9px;font-size:12px}
+#sRes table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+#sRes th{font-weight:500;color:var(--mu);text-align:left;padding:4px 8px;font-size:12px;white-space:nowrap}
+#sRes td{padding:5px 8px;border-top:1px solid #1d2127;white-space:nowrap}
+#sRes img{width:64px;height:40px;object-fit:cover;border-radius:4px;display:block;background:#000}
+#sRes .note{color:var(--mu);max-width:180px;overflow:hidden;text-overflow:ellipsis;cursor:text}
+#sRes .act button{padding:3px 8px;font-size:12px}
+#sRes .empty{padding:6px 14px 14px;color:var(--mu)}
+.vd{display:inline-block;padding:2px 8px;border-radius:99px;font-weight:600;font-size:12px}
+.vd.good{background:#123320;color:#86efac}.vd.ok{background:#3a2a0c;color:#fde3a7}.vd.bad{background:#3a1414;color:#fca5a5}
+#sSide{background:var(--p);border-left:1px solid var(--ln);overflow:auto;padding:6px 16px 20px;scrollbar-width:thin;scrollbar-color:#2a2f37 transparent}
+.st{margin:16px 0 8px;font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:var(--mu);font-weight:600;display:flex;gap:8px;align-items:center}
+.st i{font-style:normal;width:18px;height:18px;border-radius:50%;background:var(--p2);border:1px solid var(--ln);display:inline-flex;align-items:center;justify-content:center;color:var(--tx);font-size:11px}
+.seg.big button{padding:10px 4px;font-weight:600}
+.seg button small{display:block;font-weight:400;color:inherit;opacity:.7;font-size:11px}
+#sWifiBox{margin-top:8px;background:var(--bg);border:1px solid var(--ln);border-radius:var(--r);padding:10px}
+#sWifiMsg{margin-top:8px;font-size:12px;color:var(--mu)}#sWifiMsg b{color:var(--tx)}
+details.more{margin-top:8px}details.more summary{cursor:pointer;color:var(--mu);font-size:12px;list-style:none}details.more summary::before{content:"\25B8  "}details.more[open] summary::before{content:"\25BE  "}
+#sGo{width:100%;padding:13px;font-size:15px;font-weight:700;margin-top:12px}
+#sGo.on{background:var(--er);border-color:var(--er)}
+#sLast{margin-top:12px;background:var(--bg);border:1px solid var(--ln);border-radius:var(--r);padding:10px;display:none}
+#sLast .vd{font-size:14px;padding:3px 12px}
+#sLast .kv{margin-top:8px}
+#sAdv{display:flex;align-items:center;gap:6px}
+#sRecB.on{background:#3a1414;border-color:var(--er);color:#fecaca}
+</style>
+<div id="simple">
+<header>
+  <div class="brand"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#3b82f6" stroke-width="2"><rect x="2" y="6" width="20" height="14" rx="3"/><circle cx="12" cy="13" r="4"/><path d="M8 6l1.5-2h5L16 6"/></svg>XIAO CAM <small>Link test</small></div>
+  <div class="pill"><span class="dot" id="sDot"></span><span id="sStat">starting...</span></div>
+  <div class="sp"></div>
+  <button id="sRecB" title="Record what arrives on this PC, until you press again">Record</button>
+  <button id="sAdv" title="All camera settings, crazy mode, profiles, updates">Advanced settings</button>
+  <button id="sQuit">Quit</button>
+</header>
+<div id="sMain">
+  <div id="sLeft">
+    <div id="sStage">
+      <img id="sv" alt="">
+      <div id="sEmpty"><b id="sEmptyT">No picture yet</b><span id="sEmptyS">Waiting for the camera...</span></div>
+      <div id="sLive"></div>
+      <div id="sProg"><div class="t"><span><span class="rd"></span><span id="sProgT">Testing</span></span><span id="sProgN"></span></div><div class="bar"><i id="sProgBar"></i></div></div>
+    </div>
+    <div id="sRes"><div class="hd"><b>Results</b><span class="sp" style="flex:1"></span><button id="sFolder">Open folder</button></div><div id="sResBody"></div></div>
+  </div>
+  <div id="sSide">
+    <div class="st"><i>1</i>Video goes over</div>
+    <div class="seg big" id="sLink"><button data-v="usb">USB cable</button><button data-v="wifi">WiFi</button></div>
+    <div id="sWifiBox" style="display:none">
+      <div class="seg" id="sAnt"><button data-v="yes">With antenna</button><button data-v="no">No antenna</button></div>
+      <div id="sWifiMsg"></div>
+      <details class="more" id="sWifiMore"><summary>WiFi setup</summary>
+        <div class="field"><label>Camera WiFi</label><div class="seg" id="sWMode"><button data-v="1">Own hotspot</button><button data-v="2">Joins my WiFi</button></div></div>
+        <div id="sWAp"><div class="two"><div class="field"><label>Hotspot name</label><input type="text" id="sApS" maxlength="32"></div><div class="field"><label>Password (8+)</label><input type="text" id="sApP" maxlength="63"></div></div></div>
+        <div id="sWSta" style="display:none"><div class="two"><div class="field"><label>My WiFi name</label><input type="text" id="sStS" maxlength="32"></div><div class="field"><label>Password</label><input type="password" id="sStP" maxlength="63"></div></div></div>
+        <div class="field"><label>Transmit power</label><select id="sTx"></select></div>
+        <button id="sWApply" class="pri" style="width:100%">Apply on the camera</button>
+        <div class="field" style="margin-top:12px"><label>Camera address (empty = automatic)</label><input type="text" id="sHost" placeholder="automatic, e.g. 192.168.4.1"></div>
+        
+      </details>
+    </div>
+    <div class="st"><i>2</i>Picture</div>
+    <div class="seg" id="sSize"><button data-v="10">Small<small>640x480</small></button><button data-v="13">Medium<small>1280x720</small></button><button data-v="max">Large<small id="sMaxL">full</small></button></div>
+    <div class="seg" id="sQual" style="margin-top:6px"><button data-v="20">Light<small>small files</small></button><button data-v="12">Normal</button><button data-v="6">Best<small>big files</small></button></div>
+    <div class="st"><i>3</i>Test</div>
+    <div class="seg" id="sLen"><button data-v="10">10 s</button><button data-v="30">30 s</button><button data-v="60">1 min</button><button data-v="300">5 min</button></div>
+    <div class="field"><label>Note (optional) - where, distance, walls...</label><input type="text" id="sNote" maxlength="80" placeholder="e.g. 10 m, one wall"></div>
+    <button id="sGo" class="pri">Start test</button>
+    <div class="hint" style="margin-top:6px">Records exactly what arrives on this PC (like the camera saving to another device) and measures it. The video is kept - freezes stay visible in it.</div>
+    <div id="sLast"></div>
+  </div>
+</div>
+</div>
+<script>
+'use strict';
+const S={link:'usb',ant:localStorage.xsAnt||'yes',len:+(localStorage.xsLen||30),tests:[],lastId:'',wasRunning:false};
+const sv=$('#sv');
+const esc=s=>String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'})[c]);
+function isAdv(){return document.body.classList.contains('adv')}
+function setAdv(on){document.body.classList.toggle('adv',on);localStorage.xadv=on?1:0;
+  if(on){sv.removeAttribute('src');startStream();layout()}else{img.removeAttribute('src');sStream()}}
+function sStream(){if(!isAdv())sv.src='/stream?'+Date.now()}
+sv.onerror=()=>{if(!isAdv())setTimeout(sStream,1500)};
+$('#sAdv').onclick=()=>setAdv(true);
+// back button inside the full studio
+{const b=el('button','','&#8592; Simple view');b.title='Back to the link test';b.onclick=()=>setAdv(false);document.querySelector('#app header .brand').after(b)}
+
+function segOn(id,v){document.querySelectorAll(id+' button').forEach(b=>b.classList.toggle('on',b.dataset.v===String(v)))}
+function segClick(id,fn){document.querySelectorAll(id+' button').forEach(b=>b.onclick=()=>fn(b.dataset.v))}
+segClick('#sLink',async v=>{S.link=v;S.linkT=Date.now();segOn('#sLink',v);await api('/api/link?m='+v);sUpd()});
+segClick('#sAnt',v=>{S.ant=v;localStorage.xsAnt=v;segOn('#sAnt',v)});segOn('#sAnt',S.ant);
+segClick('#sLen',v=>{S.len=+v;localStorage.xsLen=v;segOn('#sLen',v)});segOn('#sLen',S.len);
+segClick('#sSize',v=>{const n=v==='max'?(B?B.max_size:15):+v;setv('framesize',n)});
+segClick('#sQual',v=>setv('quality',v));
+segClick('#sWMode',v=>{S.wmode=+v;segOn('#sWMode',v);$('#sWAp').style.display=v==='1'?'':'none';$('#sWSta').style.display=v==='2'?'':'none'});
+$('#sTx').innerHTML=TXP.map(([v,l])=>`<option value="${v}">${l}</option>`).join('');
+$('#sTx').onchange=e=>setv('tx_power',e.target.value);
+document.querySelectorAll('#sWifiMore input').forEach(i=>i.addEventListener('input',()=>i.dataset.dirty=1));
+$('#sWApply').onclick=async()=>{const m=S.wmode||1;
+  if(m===1){const ss=$('#sApS').value.trim(),pw=$('#sApP').value;if(!ss){toast('Hotspot name is empty');return}if(pw&&pw.length<8){toast('Hotspot password: 8+ characters');return}
+    await api('/api/str?k=ap_ssid&v='+encodeURIComponent(ss));await api('/api/str?k=ap_pass&v='+encodeURIComponent(pw))}
+  else{const ss=$('#sStS').value.trim();if(!ss){toast('Type your WiFi name');return}
+    await api('/api/str?k=sta_ssid&v='+encodeURIComponent(ss));await api('/api/str?k=sta_pass&v='+encodeURIComponent($('#sStP').value))}
+  const r=await api('/api/set?k=wifi&v='+m);document.querySelectorAll('#sWifiMore [data-dirty]').forEach(i=>delete i.dataset.dirty);
+  toast(r.ok?(m===2?'Camera is joining your WiFi - its address shows here in a few seconds':'Hotspot set'):noSendMsg())};
+$('#sHost').addEventListener('change',async e=>{const r=await api('/api/link/host?h='+encodeURIComponent(e.target.value.trim()));toast(r.ok?(e.target.value.trim()?'Using '+e.target.value.trim():'Address: automatic'):(r.err||'Bad address'))});
+
+$('#sGo').onclick=async()=>{const T=window.sT;
+  if(T&&T.running){await api('/api/test/stop');toast('Stopping - saving what was recorded');return}
+  const r=await api('/api/test/start?sec='+S.len+'&ant='+(S.link==='wifi'?S.ant:'')+'&note='+encodeURIComponent($('#sNote').value.trim()));
+  if(!r.ok)toast('Cannot start: '+(r.err||''))};
+$('#sRecB').onclick=toggleRec;
+$('#sFolder').onclick=()=>api('/api/test/open');
+two($('#sQuit'),'Click to confirm',async()=>{await api('/api/quit');document.body.innerHTML='<div style="display:flex;height:100%;align-items:center;justify-content:center;color:#8b94a1">Studio stopped. You can close this tab.</div>'});
+
+// ---------- words for numbers ----------
+const sig=d=>!d?'-':d+' dBm';
+const ms=v=>v>=0?Math.round(v)+' ms':'-';
+const rate=k=>k>=1024?(k/1024).toFixed(1)+' MB/s':Math.round(k)+' KB/s';
+function linkName(t){return t.link==='wifi'?'WiFi'+(t.antenna==='yes'?' + antenna':t.antenna==='no'?' no antenna':''):'USB cable'}
+
+// ---------- live ----------
+function sUpd(s){if(!P)return;const L=s&&s.link||window.sL||{};if(s){window.sL=L;window.sT=s.test}
+  if(S.linkT&&Date.now()-S.linkT<1500){}else if(L.mode&&L.mode!==S.link){S.link=L.mode}
+  segOn('#sLink',S.link);const wf=S.link==='wifi';$('#sWifiBox').style.display=wf?'':'none';
+  const dot=$('#sDot'),st=$('#sStat');dot.className='dot '+(P.live?'ok':(P.connected||L.overWifi)?'wa':'er');
+  st.textContent=P.demo?'Demo camera'+(wf?' over WiFi':''):wf?(L.status||'WiFi'):(P.port?P.port+' - ':'')+P.status;
+  // live numbers
+  const li=[];if(P.live){li.push(`<span><b>${P.fps.toFixed(0)}</b>fps</span>`,`<span><b>${rate(P.kbps/8)}</b></span>`);if(P.lat>=0)li.push(`<span><b>${Math.round(P.lat)}</b>ms delay</span>`);
+    if(wf&&B){const r=B.rssi||B.ap_rssi;if(r)li.push(`<span><b>${r}</b>dBm signal</span>`)}if(P.w)li.push(`<span><b>${P.w}x${P.h}</b></span>`)}
+  $('#sLive').innerHTML=li.join('');
+  $('#sEmpty').style.display=P.live?'none':'flex';
+  if(wf){$('#sEmptyT').textContent='No WiFi video yet';$('#sEmptyS').innerHTML=wifiHelp(true)}
+  else{$('#sEmptyT').textContent='No picture yet';$('#sEmptyS').textContent=P.connected?(P.oldfw?'Old firmware on the camera - open Advanced settings and flash it.':'Connected - waiting for pictures...'):'Plug the XIAO in with a USB-C data cable.'}
+  if(P.live&&!sUpd.live&&!isAdv())sStream();sUpd.live=P.live;
+  if(wf)$('#sWifiMsg').innerHTML=wifiHelp(false);
+  // picture + wifi fields
+  if(B){segOn('#sSize',B.framesize===B.max_size?'max':B.framesize);segOn('#sQual',B.quality);$('#sMaxL').textContent=B.sizes&&B.sizes[B.max_size]?B.sizes[B.max_size].join('x'):'full';
+    const fill=(id,v)=>{const e=$(id);if(e&&!e.dataset.dirty&&document.activeElement!==e&&v!==undefined)e.value=v};
+    fill('#sApS',B.ap_ssid);fill('#sApP',B.ap_pass);fill('#sStS',B.sta_ssid);fill('#sStP',B.sta_pass);fill('#sTx',B.tx_power);
+    if(!S.wmode){S.wmode=B.wifi&2?2:1;segOn('#sWMode',S.wmode);$('#sWAp').style.display=S.wmode===1?'':'none';$('#sWSta').style.display=S.wmode===2?'':'none'}}
+  const hi=$('#sHost');if(document.activeElement!==hi&&L.host!==undefined&&!hi.dataset.dirty)hi.value=L.host;
+  // record button
+  const r=P.rec;$('#sRecB').classList.toggle('on',!!r);$('#sRecB').textContent=r?'Stop recording '+mmss(r.secs):'Record';
+  // test
+  const T=window.sT||{};const g=$('#sGo');g.classList.toggle('on',!!T.running);
+  g.textContent=T.running?(T.phase==='recording'?'Stop test':T.phase+'...'):'Start test';
+  $('#sProg').style.display=T.running?'block':'none';
+  if(T.running){$('#sProgT').textContent=T.phase==='recording'?'Testing '+linkName({link:S.link,antenna:wf?S.ant:''}):T.phase;$('#sProgN').textContent=T.phase==='recording'?mmss(T.elapsed)+' / '+mmss(T.secs):'';$('#sProgBar').style.width=(T.secs?Math.min(100,T.elapsed/T.secs*100):0)+'%'}
+  if(S.wasRunning&&!T.running){if(T.err)toast('Test failed: '+T.err);loadTests(true)}S.wasRunning=!!T.running}
+function wifiHelp(big){if(!B&&!P.demo)return'Plug the camera into USB once to set up WiFi, or type its address in WiFi setup.';
+  const L=window.sL||{};const host=L.url?L.url.replace(/^http:\/\/|:81\/stream$/g,''):'';
+  if(P.live)return`Receiving over WiFi from <b>${esc(host)}</b>`+(L.overWifi?' (camera not on USB - settings go over WiFi)':'')+'.';
+  if(B&&(B.wifi&2)&&B.sta_ip)return`The camera is on your WiFi <b>${esc(B.sta_ssid)}</b> at <b>${esc(B.sta_ip)}</b>. This PC must be on the same network.`;
+  if(B&&(B.wifi&2)&&!B.sta_ip)return`The camera is trying to join <b>${esc(B.sta_ssid||'?')}</b> (${esc(STA[B.sta_status]||'...')}).`;
+  if(B&&(B.wifi&1))return`Connect this PC to the WiFi <b>${esc(B.ap_ssid)}</b> (password <b>${esc(B.ap_pass||'none')}</b>) - Windows WiFi menu, bottom right.`+(big?'':' No WiFi on this PC? Use WiFi setup: Joins my WiFi.');
+  if(B&&!B.wifi)return'WiFi is off on the camera. Open WiFi setup and press Apply.';
+  return'Looking for the camera on '+esc(host||'192.168.4.1')+'...'}
+
+// ---------- results ----------
+async function loadTests(showLast){const r=await api('/api/test/list');if(!Array.isArray(r))return;S.tests=r;drawTests();if(showLast&&r[0])drawLast(r[0])}
+function drawLast(t){const d=$('#sLast');d.style.display='block';
+  d.innerHTML=`<b>Last test: ${esc(linkName(t))}</b>
+  <div class="kv">${[['Frames per second',t.fps+(t.camFps>0?' of '+t.camFps:'')],['Arrived',t.delivered>=0?t.delivered+'%':'-'],['Freezes',t.freezes+(t.freezes?' (longest '+ms(t.maxGap)+')':'')],['Delay',ms(t.lat)+(t.lat90>=0?' (worst '+ms(t.lat90)+')':'')],['Signal',t.link==='wifi'?sig(t.rssi):'cable'],['Data',rate(t.kbps)]].map(([a,b])=>`<span>${a}</span><b>${b}</b>`).join('')}</div>
+  <div class="btns">${t.video?`<button onclick="playTest('${t.id}')">Play video</button>`:''}</div>`}
+const COLS=[['fps','fps',1],['delivered','Arrived',1],['freezes','Freezes',-1],['maxGap','Longest freeze',-1],['lat','Delay',-1],['rssi','Signal',1],['kbps','Data',1]];
+function drawTests(){const b=$('#sResBody');const T=S.tests;
+  if(!T.length){b.innerHTML='<div class="empty">No tests yet. Pick how the video goes, press <b>Start test</b>. Then switch (antenna / no antenna / cable) and test again - results line up here.</div>';return}
+  const cell=(t,k,txt)=>`<td>${txt}</td>`;
+  b.innerHTML=`<table><tr><th></th><th>When</th><th>Link</th><th>Note</th><th>Picture</th>${COLS.map(c=>`<th>${c[1]}</th>`).join('')}<th></th></tr>`+T.map(t=>`<tr>
+    <td>${t.video?`<img src="/test/thumb?id=${t.id}" loading="lazy">`:''}</td><td>${esc((t.time||'').replace('T',' ').slice(5,16))}</td><td><b>${esc(linkName(t))}</b></td>
+    <td class="note" data-id="${t.id}" title="Click to edit">${esc(t.note)||'<span style="opacity:.5">+ note</span>'}</td>
+<td>${t.w}x${t.h} q${t.quality}</td>
+    ${cell(t,'fps',t.fps)}${cell(t,'delivered',t.delivered>=0?t.delivered+'%':'-')}${cell(t,'freezes',t.freezes)}${cell(t,'maxGap',ms(t.maxGap))}${cell(t,'lat',ms(t.lat))}${cell(t,'rssi',t.link==='wifi'?(t.rssi?t.rssi+' dBm':'-'):'cable')}${cell(t,'kbps',rate(t.kbps))}
+    <td class="act">${t.video?`<button onclick="playTest('${t.id}')">Play</button> `:''}<button class="danger" data-del="${t.id}">Delete</button></td></tr>`).join('')+'</table>';
+  b.querySelectorAll('[data-del]').forEach(x=>two(x,'Sure?',async()=>{await api('/api/test/delete?id='+x.dataset.del);loadTests()}));
+  b.querySelectorAll('.note').forEach(n=>n.onclick=()=>{if(n.querySelector('input'))return;const t=S.tests.find(z=>z.id===n.dataset.id);const i=el('input');i.type='text';i.maxLength=80;i.value=t.note||'';n.innerHTML='';n.appendChild(i);i.focus();
+    const done=async()=>{await api('/api/test/note?id='+t.id+'&note='+encodeURIComponent(i.value.trim()));loadTests()};i.onblur=done;i.onkeydown=e=>{if(e.key==='Enter')i.blur();if(e.key==='Escape'){i.onblur=null;drawTests()}}})}
+async function playTest(id){const r=await api('/api/test/open?id='+id);if(!r.ok)toast(r.err||'Cannot open')}
+
+if(localStorage.xadv==='1')setAdv(true);else{img.removeAttribute('src');sStream()}
+loadTests(false);
+</script>
